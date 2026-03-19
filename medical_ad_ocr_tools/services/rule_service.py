@@ -91,11 +91,16 @@ def _risk_level(score: int, config: RuleConfig) -> str:
     return "low"
 
 
+def _is_suspicious_score(score: int, config: RuleConfig, medical_hits: list[str], illegal_hits: list[str]) -> bool:
+    return score >= config.suspicious_score or bool(medical_hits and illegal_hits)
+
+
 def _build_evidence(blocks: list[OCRBlock]) -> list[BoxEvidence]:
     config = get_rule_config()
     phone_pattern = re.compile(config.phone_pattern)
     wechat_pattern = re.compile(config.wechat_pattern, re.IGNORECASE)
     qq_pattern = re.compile(config.qq_pattern, re.IGNORECASE)
+    extra_noise_keywords = ["刻章", "办证", "贷款", "发票"]
     evidence_list: list[BoxEvidence] = []
     for index, block in enumerate(blocks):
         text = block.text
@@ -109,7 +114,7 @@ def _build_evidence(blocks: list[OCRBlock]) -> list[BoxEvidence]:
                 phones=sorted({item for item in (_normalize_phone(raw) for raw in phone_pattern.findall(text)) if item}),
                 wechat_ids=sorted(set(wechat_pattern.findall(text))),
                 qqs=sorted(set(qq_pattern.findall(text))),
-                noise_hits=_contains_any(text, config.noise_keywords),
+                noise_hits=_contains_any(text, config.noise_keywords + extra_noise_keywords),
             )
         )
     return evidence_list
@@ -210,7 +215,10 @@ def _clip_region(points: list[list[int]], image_shape: tuple[int, int, int] | No
     return clipped, (min(xs), min(ys), max(xs), max(ys))
 
 
-def _score_candidate(candidate_items: list[BoxEvidence]) -> tuple[int, list[str], list[str], list[str], list[str], list[str], list[str]]:
+def _score_candidate(
+    candidate_items: list[BoxEvidence],
+    global_noise_hits: set[str] | None = None,
+) -> tuple[int, list[str], list[str], list[str], list[str], list[str], list[str]]:
     config = get_rule_config()
     scores = config.scores
     medical_hits = sorted({word for item in candidate_items for word in item.medical_hits})
@@ -218,6 +226,7 @@ def _score_candidate(candidate_items: list[BoxEvidence]) -> tuple[int, list[str]
     phones = sorted({phone for item in candidate_items for phone in item.phones})
     wechat_ids = sorted({value for item in candidate_items for value in item.wechat_ids})
     qqs = sorted({value for item in candidate_items for value in item.qqs})
+    noise_hits = sorted({word for item in candidate_items for word in item.noise_hits} | set(global_noise_hits or set()))
 
     score = 0
     hit_rules: list[str] = []
@@ -239,12 +248,16 @@ def _score_candidate(candidate_items: list[BoxEvidence]) -> tuple[int, list[str]
     if medical_hits and (phones or wechat_ids or qqs):
         score += scores.get("medical_with_contact", 20)
         hit_rules.append("combo.medical_contact")
+    if medical_hits and illegal_hits:
+        score += scores.get("medical_illegal_combo", 12)
+        hit_rules.append("combo.medical_illegal")
     if len(illegal_hits) >= 2:
         score += scores.get("illegal_multi_bonus", 10)
         hit_rules.append("combo.multi_illegal")
     if phones and not medical_hits and not illegal_hits:
-        score = max(score, scores.get("phone_only_floor", 48))
-        hit_rules.append("fallback.phone_only")
+        if not noise_hits:
+            score = max(score, scores.get("phone_only_floor", 48))
+            hit_rules.append("fallback.phone_only")
     return min(score, 100), sorted(set(hit_rules)), medical_hits, illegal_hits, phones, wechat_ids, qqs
 
 
@@ -255,6 +268,7 @@ def _as_blocks(records: list[OCRRecord] | list[OCRBlockInput]) -> list[OCRBlock]
 def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, request_id: str = "rule-evaluate") -> RuleEvaluationResponse:
     config = get_rule_config()
     evidence_list = _build_evidence(blocks)
+    global_noise_hits = {word for item in evidence_list for word in item.noise_hits}
     ads: list[AdRegion] = []
     groups: list[tuple[list[list[int]], tuple[int, int, int, int], list[BoxEvidence]]] = []
 
@@ -267,8 +281,8 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
     groups.extend(_build_text_regions(evidence_list))
 
     for region_points, region_bbox, items in groups:
-        score, hit_rules, medical_hits, illegal_hits, phones, wechat_ids, qqs = _score_candidate(items)
-        if score < config.suspicious_score and not (medical_hits and illegal_hits):
+        score, hit_rules, medical_hits, illegal_hits, phones, wechat_ids, qqs = _score_candidate(items, global_noise_hits=global_noise_hits)
+        if not _is_suspicious_score(score, config, medical_hits, illegal_hits):
             continue
         refined_points, _ = _refine_region(items, region_points)
         refined_points, refined_bbox = _clip_region(refined_points, image.shape if image is not None else None)
@@ -288,7 +302,7 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
             qqs=qqs,
             risk_score=score,
             risk_level=_risk_level(score, config),  # type: ignore[arg-type]
-            suspicious=score >= config.suspicious_score,
+            suspicious=_is_suspicious_score(score, config, medical_hits, illegal_hits),
         )
 
         duplicate_index = -1

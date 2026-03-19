@@ -48,6 +48,12 @@ def analyze_image(request_id: str, image_path: Path, image_source: str) -> Workf
         focus_retry_reason=ocr_result.focus_retry_reason,
         focus_region=ocr_result.focus_region,
         focus_retry_added_boxes=ocr_result.focus_retry_added_boxes,
+        focus_retry_variant=ocr_result.focus_retry_variant,
+        focus_retry_semantic_score=ocr_result.focus_retry_semantic_score,
+        round1_low_semantic_confidence=ocr_result.round1_low_semantic_confidence,
+        selected_by_semantic_score=ocr_result.selected_by_semantic_score,
+        focus_region_angle=ocr_result.focus_region_angle,
+        focus_region_shape=ocr_result.focus_region_shape,
         annotated_image_url=annotated_image_url,
         annotated_image_oss_key=annotated_image_oss_key,
     )

@@ -46,6 +46,10 @@ class OCRConfig(BaseModel):
     focus_retry_enable_sharpen: bool = True
     focus_retry_enable_contrast: bool = True
     focus_retry_enable_rotate: bool = False
+    focus_retry_enable_mirror: bool = True
+    focus_retry_enable_perspective: bool = True
+    focus_retry_deskew_angle_min: float = 8.0
+    focus_retry_deskew_angle_max: float = 20.0
 
 
 class AnnotationConfig(BaseModel):
@@ -105,6 +109,10 @@ class Settings(BaseModel):
             focus_retry_enable_sharpen=self.ocr.focus_retry_enable_sharpen,
             focus_retry_enable_contrast=self.ocr.focus_retry_enable_contrast,
             focus_retry_enable_rotate=self.ocr.focus_retry_enable_rotate,
+            focus_retry_enable_mirror=self.ocr.focus_retry_enable_mirror,
+            focus_retry_enable_perspective=self.ocr.focus_retry_enable_perspective,
+            focus_retry_deskew_angle_min=self.ocr.focus_retry_deskew_angle_min,
+            focus_retry_deskew_angle_max=self.ocr.focus_retry_deskew_angle_max,
             annotation_quality=self.annotation.quality,
             annotation_max_edge=self.annotation.max_edge,
             annotation_line_width=self.annotation.line_width,
@@ -171,6 +179,10 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         "MEDICAL_AD_FOCUS_RETRY_ENABLE_SHARPEN": ("ocr.focus_retry_enable_sharpen", _parse_bool),
         "MEDICAL_AD_FOCUS_RETRY_ENABLE_CONTRAST": ("ocr.focus_retry_enable_contrast", _parse_bool),
         "MEDICAL_AD_FOCUS_RETRY_ENABLE_ROTATE": ("ocr.focus_retry_enable_rotate", _parse_bool),
+        "MEDICAL_AD_FOCUS_RETRY_ENABLE_MIRROR": ("ocr.focus_retry_enable_mirror", _parse_bool),
+        "MEDICAL_AD_FOCUS_RETRY_ENABLE_PERSPECTIVE": ("ocr.focus_retry_enable_perspective", _parse_bool),
+        "MEDICAL_AD_FOCUS_RETRY_DESKEW_ANGLE_MIN": ("ocr.focus_retry_deskew_angle_min", float),
+        "MEDICAL_AD_FOCUS_RETRY_DESKEW_ANGLE_MAX": ("ocr.focus_retry_deskew_angle_max", float),
         "MEDICAL_AD_ANNOTATION_QUALITY": ("annotation.quality", int),
         "MEDICAL_AD_ANNOTATION_MAX_EDGE": ("annotation.max_edge", int),
         "MEDICAL_AD_ANNOTATION_LINE_WIDTH": ("annotation.line_width", int),

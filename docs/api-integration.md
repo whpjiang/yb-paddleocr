@@ -117,6 +117,24 @@ Content-Type: application/json
 - `focus_retry_added_boxes`
   - 类型：`integer`
   - 含义：二次补识别相比首轮新增的 OCR 文字块数量。
+- `focus_retry_variant`
+  - 类型：`string`
+  - 含义：二次补识别最终采用的候选版本，可能为 `normal`、`mirrored`、`rotate_90`、`rotate_270`、`deskew`、`perspective`。
+- `focus_retry_semantic_score`
+  - 类型：`number`
+  - 含义：重点补识别最终候选的业务语义得分。
+- `round1_low_semantic_confidence`
+  - 类型：`boolean`
+  - 含义：首轮 OCR 是否存在“识别结果置信度看起来不低，但业务语义明显不可信”的情况。
+- `selected_by_semantic_score`
+  - 类型：`boolean`
+  - 含义：最终 focus retry 候选是否是按语义得分优选出来的。
+- `focus_region_angle`
+  - 类型：`number`
+  - 含义：重点区域估计偏斜角度，单位为度。
+- `focus_region_shape`
+  - 类型：`string`
+  - 含义：重点区域形态，可能为 `rectangle`、`trapezoid`、`irregular`。
 - `annotated_image_url`
   - 类型：`string|null`
   - 含义：命中风险且上传 OSS 成功后的标注图 URL。
@@ -253,6 +271,12 @@ Content-Type: application/json
   "focus_retry_reason": "",
   "focus_region": null,
   "focus_retry_added_boxes": 0,
+  "focus_retry_variant": "",
+  "focus_retry_semantic_score": 0.0,
+  "round1_low_semantic_confidence": false,
+  "selected_by_semantic_score": false,
+  "focus_region_angle": 0.0,
+  "focus_region_shape": "",
   "annotated_image_url": null,
   "annotated_image_oss_key": null
 }
@@ -325,6 +349,7 @@ Content-Type: application/json
 
 - `medical.keyword`：命中医保相关关键词
 - `illegal.keyword`：命中套现、回收、取现等违规关键词
+- `combo.medical_illegal`：医保相关关键词和违规关键词同时出现
 - `contact.phone`：命中手机号
 - `contact.wechat`：命中微信号
 - `contact.qq`：命中 QQ 号

@@ -31,6 +31,10 @@ ocr:
   focus_retry_enable_sharpen: true
   focus_retry_enable_contrast: true
   focus_retry_enable_rotate: false
+  focus_retry_enable_mirror: true
+  focus_retry_enable_perspective: true
+  focus_retry_deskew_angle_min: 8
+  focus_retry_deskew_angle_max: 20
 
 annotation:
   quality: 82

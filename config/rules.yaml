@@ -93,5 +93,6 @@ scores:
   wechat: 18
   qq: 16
   medical_with_contact: 20
+  medical_illegal_combo: 12
   illegal_multi_bonus: 10
   phone_only_floor: 48

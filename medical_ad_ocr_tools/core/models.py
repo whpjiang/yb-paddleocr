@@ -93,6 +93,12 @@ class AnalyzeResponse(RuleEvaluationResponse):
     focus_retry_reason: str = ""
     focus_region: FocusRegion | None = None
     focus_retry_added_boxes: int = 0
+    focus_retry_variant: str = ""
+    focus_retry_semantic_score: float = 0.0
+    round1_low_semantic_confidence: bool = False
+    selected_by_semantic_score: bool = False
+    focus_region_angle: float = 0.0
+    focus_region_shape: str = ""
     annotated_image_url: str | None = None
     annotated_image_oss_key: str | None = None
 
@@ -117,6 +123,12 @@ class OCRRunResult(BaseModel):
     focus_retry_reason: str = ""
     focus_region: FocusRegion | None = None
     focus_retry_added_boxes: int = 0
+    focus_retry_variant: str = ""
+    focus_retry_semantic_score: float = 0.0
+    round1_low_semantic_confidence: bool = False
+    selected_by_semantic_score: bool = False
+    focus_region_angle: float = 0.0
+    focus_region_shape: str = ""
 
 
 class AnalyzeArtifacts(BaseModel):
@@ -182,6 +194,10 @@ class FlatConfig(BaseModel):
     focus_retry_enable_sharpen: bool
     focus_retry_enable_contrast: bool
     focus_retry_enable_rotate: bool
+    focus_retry_enable_mirror: bool
+    focus_retry_enable_perspective: bool
+    focus_retry_deskew_angle_min: float
+    focus_retry_deskew_angle_max: float
     annotation_quality: int
     annotation_max_edge: int
     annotation_line_width: int
