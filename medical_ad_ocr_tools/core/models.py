@@ -99,8 +99,8 @@ class AnalyzeResponse(RuleEvaluationResponse):
     selected_by_semantic_score: bool = False
     focus_region_angle: float = 0.0
     focus_region_shape: str = ""
-    annotated_image_url: str | None = None
-    annotated_image_oss_key: str | None = None
+    annotated_image_name: str | None = None
+    annotated_image_base64: str | None = None
 
 
 class HealthResponse(BaseModel):
@@ -136,8 +136,7 @@ class AnalyzeArtifacts(BaseModel):
     source_label: str
     original_image_shape: tuple[int, int, int]
     annotated_image_path: str | None = None
-    annotated_image_url: str | None = None
-    annotated_image_oss_key: str | None = None
+    annotated_image_name: str | None = None
 
 
 class WorkflowResult(BaseModel):

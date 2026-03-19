@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import cv2
@@ -7,12 +8,17 @@ import cv2
 from medical_ad_ocr_tools.core.models import AnalyzeArtifacts, AnalyzeResponse, OCRBlock, OCRRecord, WorkflowResult
 from medical_ad_ocr_tools.services.annotator import draw_annotations
 from medical_ad_ocr_tools.services.ocr_service import run_ocr
-from medical_ad_ocr_tools.services.oss_uploader import upload_file
 from medical_ad_ocr_tools.services.rule_service import evaluate_blocks
 
 
 def _records_to_blocks(records: list[OCRRecord]) -> list[OCRBlock]:
     return [OCRBlock(text=item.text, points=item.points, confidence=item.confidence) for item in records]
+
+
+def _encode_file_base64(path: Path | None) -> str | None:
+    if path is None or not path.exists():
+        return None
+    return base64.b64encode(path.read_bytes()).decode("ascii")
 
 
 def analyze_image(request_id: str, image_path: Path, image_source: str) -> WorkflowResult:
@@ -25,9 +31,8 @@ def analyze_image(request_id: str, image_path: Path, image_source: str) -> Workf
     evaluation.ocr_text = ocr_result.ocr_text
 
     annotated_image_path = draw_annotations(image_path=image_path, request_id=request_id, evaluation=evaluation)
-    annotated_image_url, annotated_image_oss_key = (None, None)
-    if annotated_image_path is not None:
-        annotated_image_url, annotated_image_oss_key = upload_file(annotated_image_path, request_id=request_id)
+    annotated_image_name = annotated_image_path.name if annotated_image_path is not None else None
+    annotated_image_base64 = _encode_file_base64(annotated_image_path)
 
     response = AnalyzeResponse(
         request_id=request_id,
@@ -54,15 +59,14 @@ def analyze_image(request_id: str, image_path: Path, image_source: str) -> Workf
         selected_by_semantic_score=ocr_result.selected_by_semantic_score,
         focus_region_angle=ocr_result.focus_region_angle,
         focus_region_shape=ocr_result.focus_region_shape,
-        annotated_image_url=annotated_image_url,
-        annotated_image_oss_key=annotated_image_oss_key,
+        annotated_image_name=annotated_image_name,
+        annotated_image_base64=annotated_image_base64,
     )
     artifacts = AnalyzeArtifacts(
         source_path=str(image_path),
         source_label=image_source,
         original_image_shape=tuple(image.shape),
         annotated_image_path=str(annotated_image_path) if annotated_image_path else None,
-        annotated_image_url=annotated_image_url,
-        annotated_image_oss_key=annotated_image_oss_key,
+        annotated_image_name=annotated_image_name,
     )
     return WorkflowResult(response=response, artifacts=artifacts)

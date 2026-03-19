@@ -30,6 +30,221 @@ class BoxEvidence:
     noise_hits: list[str]
 
 
+def estimate_block_angle(block: OCRBlock) -> float:
+    points = np.array(block.points, dtype=np.float32)
+    if len(points) < 4:
+        return 0.0
+    rect = cv2.minAreaRect(points)
+    (width, height) = rect[1]
+    angle = float(rect[2])
+    if width < height:
+        angle -= 90.0
+    while angle <= -45.0:
+        angle += 90.0
+    while angle > 45.0:
+        angle -= 90.0
+    return angle
+
+
+def extract_patch(image: np.ndarray | None, bbox: tuple[int, int, int, int], padding: int = 6) -> np.ndarray | None:
+    if image is None:
+        return None
+    height, width = image.shape[:2]
+    x1 = max(0, bbox[0] - padding)
+    y1 = max(0, bbox[1] - padding)
+    x2 = min(width, bbox[2] + padding)
+    y2 = min(height, bbox[3] + padding)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    patch = image[y1:y2, x1:x2]
+    return patch if patch.size else None
+
+
+def estimate_patch_signature(patch: np.ndarray | None) -> dict[str, np.ndarray] | None:
+    if patch is None or patch.size == 0:
+        return None
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(patch, cv2.COLOR_BGR2LAB)
+    return {
+        "hsv_mean": hsv.reshape(-1, 3).mean(axis=0),
+        "hsv_std": hsv.reshape(-1, 3).std(axis=0),
+        "lab_mean": lab.reshape(-1, 3).mean(axis=0),
+        "lab_std": lab.reshape(-1, 3).std(axis=0),
+    }
+
+
+def patch_similarity(sig1: dict[str, np.ndarray] | None, sig2: dict[str, np.ndarray] | None) -> float:
+    if sig1 is None or sig2 is None:
+        return 0.5
+    mean_dist = float(np.linalg.norm(sig1["lab_mean"] - sig2["lab_mean"]) / 100.0)
+    std_dist = float(np.linalg.norm(sig1["lab_std"] - sig2["lab_std"]) / 60.0)
+    score = 1.0 - min(1.0, mean_dist * 0.75 + std_dist * 0.25)
+    return round(max(0.0, score), 4)
+
+
+def _item_center(item: BoxEvidence) -> tuple[float, float]:
+    x1, y1, x2, y2 = _box_bounds(item.block.points)
+    return (x1 + x2) / 2, (y1 + y2) / 2
+
+
+def _center_distance(a: BoxEvidence, b: BoxEvidence) -> float:
+    ax, ay = _item_center(a)
+    bx, by = _item_center(b)
+    return float(np.hypot(ax - bx, ay - by))
+
+
+def _is_noise_only_item(item: BoxEvidence) -> bool:
+    return bool(item.noise_hits and not (item.medical_hits or item.illegal_hits))
+
+
+def _contact_like_digits(item: BoxEvidence) -> bool:
+    text = item.block.text
+    return bool(re.search(r"\d{6,}", text)) or bool(item.contact_hits)
+
+
+def collect_core_items(items: list[BoxEvidence]) -> list[BoxEvidence]:
+    cores = [item for item in items if item.medical_hits or item.illegal_hits]
+    if not cores:
+        return []
+    selected: dict[int, BoxEvidence] = {item.index: item for item in cores}
+    for item in items:
+        if item.index in selected or _is_noise_only_item(item) or item.phones or item.wechat_ids or item.qqs:
+            continue
+        if any(_center_distance(item, core) <= 90 for core in cores):
+            selected[item.index] = item
+    return list(selected.values())
+
+
+def collect_contact_items(items: list[BoxEvidence]) -> list[BoxEvidence]:
+    return [item for item in items if item.phones or item.wechat_ids or item.qqs or _contact_like_digits(item)]
+
+
+def contact_alignment_score(contact_block: OCRBlock, core_blocks: list[OCRBlock]) -> tuple[float, float]:
+    if not core_blocks:
+        return 0.2, 90.0
+    contact_angle = estimate_block_angle(contact_block)
+    core_angles = [estimate_block_angle(block) for block in core_blocks]
+    core_angle = float(np.median(core_angles))
+    angle_diff = abs(contact_angle - core_angle)
+    angle_diff = min(angle_diff, abs(angle_diff - 90.0))
+    if angle_diff <= 12:
+        return 1.0, angle_diff
+    if angle_diff <= 25:
+        return 0.65, angle_diff
+    return 0.2, angle_diff
+
+
+def contact_background_similarity(contact_item: BoxEvidence, core_items: list[BoxEvidence], image: np.ndarray | None) -> float:
+    if image is None or not core_items:
+        return 0.5
+    contact_sig = estimate_patch_signature(extract_patch(image, _box_bounds(contact_item.block.points)))
+    sims = [
+        patch_similarity(contact_sig, estimate_patch_signature(extract_patch(image, _box_bounds(core.block.points))))
+        for core in core_items
+    ]
+    return round(sum(sims) / max(1, len(sims)), 4)
+
+
+def score_contact_attachment(
+    contact_item: BoxEvidence,
+    core_items: list[BoxEvidence],
+    image: np.ndarray | None,
+    candidate_items: list[BoxEvidence],
+) -> tuple[float, dict[str, float], str]:
+    if not core_items:
+        return 0.0, {"angle_diff": 90.0, "patch_similarity": 0.0}, "no_core_items"
+
+    core_blocks = [item.block for item in core_items]
+    align_score, angle_diff = contact_alignment_score(contact_item.block, core_blocks)
+    patch_score = contact_background_similarity(contact_item, core_items, image)
+
+    region_bbox = (
+        min(_box_bounds(item.block.points)[0] for item in core_items),
+        min(_box_bounds(item.block.points)[1] for item in core_items),
+        max(_box_bounds(item.block.points)[2] for item in core_items),
+        max(_box_bounds(item.block.points)[3] for item in core_items),
+    )
+    diag = max(1.0, float(np.hypot(region_bbox[2] - region_bbox[0], region_bbox[3] - region_bbox[1])))
+    min_dist = min(_center_distance(contact_item, core) for core in core_items)
+    distance_score = max(0.0, 1.0 - min(1.0, min_dist / diag))
+
+    same_cluster_score = 1.0 if any(_center_distance(contact_item, core) <= 80 for core in core_items) else 0.35
+    cx, cy = _item_center(contact_item)
+    core_centers = [_item_center(core) for core in core_items]
+    core_cx = sum(x for x, _ in core_centers) / len(core_centers)
+    core_cy = sum(y for _, y in core_centers) / len(core_centers)
+    layout_score = 0.8 if (cy >= core_cy - 20 and abs(cx - core_cx) <= max(60.0, diag * 0.4)) else 0.4
+
+    nearby_noise = any(
+        other.noise_hits and _center_distance(contact_item, other) <= 85
+        for other in candidate_items
+        if other.index != contact_item.index
+    ) or bool(contact_item.noise_hits)
+    noise_penalty = 0.35 if nearby_noise else 0.0
+
+    score = align_score * 0.24 + patch_score * 0.24 + distance_score * 0.20 + same_cluster_score * 0.16 + layout_score * 0.16 - noise_penalty
+    score = round(max(0.0, min(1.0, score)), 4)
+
+    reason = ""
+    if nearby_noise and score < 0.6:
+        reason = "noise_nearby"
+    elif angle_diff > 25:
+        reason = "angle_mismatch"
+    elif patch_score < 0.45:
+        reason = "background_mismatch"
+    elif score < 0.55:
+        reason = "low_attachment_score"
+    return score, {"angle_diff": round(angle_diff, 4), "patch_similarity": patch_score}, reason
+
+
+def filter_attached_contacts(
+    items: list[BoxEvidence],
+    all_items: list[BoxEvidence],
+    image: np.ndarray | None,
+    request_id: str,
+    group_index: int,
+) -> tuple[list[str], list[str], list[str], list[int]]:
+    core_items = collect_core_items(items)
+    contact_items = collect_contact_items(items)
+    logger.info("evaluate_blocks request_id=%s group=%s core_items=%s contact_items=%s", request_id, group_index, [item.index for item in core_items], [item.index for item in contact_items])
+    if not core_items or not contact_items:
+        return [], [], [], []
+
+    best_phone: tuple[float, BoxEvidence] | None = None
+    best_wechat: tuple[float, BoxEvidence] | None = None
+    best_qq: tuple[float, BoxEvidence] | None = None
+    attached_indices: list[int] = []
+
+    for contact_item in contact_items:
+        score, debug, reject_reason = score_contact_attachment(contact_item, core_items, image, all_items)
+        accepted = score >= 0.55
+        logger.info(
+            "evaluate_blocks request_id=%s group=%s contact_item=%s attachment_score=%.4f angle_diff=%.4f patch_similarity=%.4f accepted=%s reject_reason=%s",
+            request_id,
+            group_index,
+            contact_item.index,
+            score,
+            debug["angle_diff"],
+            debug["patch_similarity"],
+            accepted,
+            reject_reason or "",
+        )
+        if not accepted:
+            continue
+        attached_indices.append(contact_item.index)
+        if contact_item.phones and (best_phone is None or score > best_phone[0]):
+            best_phone = (score, contact_item)
+        if contact_item.wechat_ids and (best_wechat is None or score > best_wechat[0]):
+            best_wechat = (score, contact_item)
+        if contact_item.qqs and (best_qq is None or score > best_qq[0]):
+            best_qq = (score, contact_item)
+
+    phones = best_phone[1].phones if best_phone is not None else []
+    wechat_ids = best_wechat[1].wechat_ids if best_wechat is not None else []
+    qqs = best_qq[1].qqs if best_qq is not None else []
+    return phones, wechat_ids, qqs, sorted(set(attached_indices))
+
+
 @lru_cache(maxsize=1)
 def get_rule_config() -> RuleConfig:
     path = Path(get_settings().rules_path)
@@ -96,6 +311,10 @@ def _risk_level(score: int, config: RuleConfig) -> str:
 
 def _is_suspicious_score(score: int, config: RuleConfig, medical_hits: list[str], illegal_hits: list[str]) -> bool:
     return score >= config.suspicious_score or bool(medical_hits and illegal_hits)
+
+
+def _should_keep_region(score: int, medical_hits: list[str], illegal_hits: list[str], phones: list[str], wechat_ids: list[str], qqs: list[str]) -> bool:
+    return bool(medical_hits or illegal_hits or phones or wechat_ids or qqs or score > 0)
 
 
 def _build_evidence(blocks: list[OCRBlock]) -> list[BoxEvidence]:
@@ -218,17 +437,59 @@ def _clip_region(points: list[list[int]], image_shape: tuple[int, int, int] | No
     return clipped, (min(xs), min(ys), max(xs), max(ys))
 
 
+def _expand_region_with_nearby_hits(region_items: list[BoxEvidence], all_items: list[BoxEvidence]) -> list[BoxEvidence]:
+    if not region_items:
+        return region_items
+    region_bbox = (
+        min(_box_bounds(item.block.points)[0] for item in region_items),
+        min(_box_bounds(item.block.points)[1] for item in region_items),
+        max(_box_bounds(item.block.points)[2] for item in region_items),
+        max(_box_bounds(item.block.points)[3] for item in region_items),
+    )
+    width = max(40, region_bbox[2] - region_bbox[0])
+    height = max(40, region_bbox[3] - region_bbox[1])
+    expanded_bbox = _expand_bbox(region_bbox, max(40, int(width * 0.35)), max(40, int(height * 0.35)))
+    region_angles = [estimate_block_angle(item.block) for item in region_items if item.medical_hits or item.illegal_hits]
+    region_angle = float(np.median(region_angles)) if region_angles else 0.0
+
+    selected: dict[int, BoxEvidence] = {item.index: item for item in region_items}
+    for item in all_items:
+        if item.index in selected or not (item.medical_hits or item.illegal_hits):
+            continue
+        if _is_noise_only_item(item):
+            continue
+        bbox = _box_bounds(item.block.points)
+        center_x = (bbox[0] + bbox[2]) / 2
+        center_y = (bbox[1] + bbox[3]) / 2
+        if not (_bbox_contains(expanded_bbox, center_x, center_y) or _intersects(expanded_bbox, bbox)):
+            continue
+        angle_diff = abs(estimate_block_angle(item.block) - region_angle)
+        angle_diff = min(angle_diff, abs(angle_diff - 90.0))
+        if angle_diff <= 25:
+            selected[item.index] = item
+    return list(selected.values())
+
+
 def _score_candidate(
     candidate_items: list[BoxEvidence],
+    *,
+    all_items: list[BoxEvidence],
+    image: np.ndarray | None = None,
+    request_id: str = "rule-evaluate",
+    group_index: int = 0,
     global_noise_hits: set[str] | None = None,
-) -> tuple[int, list[str], list[str], list[str], list[str], list[str], list[str]]:
+) -> tuple[int, list[str], list[str], list[str], list[str], list[str], list[str], list[int]]:
     config = get_rule_config()
     scores = config.scores
     medical_hits = sorted({word for item in candidate_items for word in item.medical_hits})
     illegal_hits = sorted({word for item in candidate_items for word in item.illegal_hits})
-    phones = sorted({phone for item in candidate_items for phone in item.phones})
-    wechat_ids = sorted({value for item in candidate_items for value in item.wechat_ids})
-    qqs = sorted({value for item in candidate_items for value in item.qqs})
+    phones, wechat_ids, qqs, attached_contact_indices = filter_attached_contacts(
+        candidate_items,
+        all_items=all_items,
+        image=image,
+        request_id=request_id,
+        group_index=group_index,
+    )
     noise_hits = sorted({word for item in candidate_items for word in item.noise_hits} | set(global_noise_hits or set()))
 
     score = 0
@@ -263,7 +524,11 @@ def _score_candidate(
             hit_rules.append("fallback.phone_only")
         else:
             logger.info("score_candidate fallback.phone_only skipped phones=%s reason=noise_hits noise_hits=%s", phones, noise_hits)
-    return min(score, 100), sorted(set(hit_rules)), medical_hits, illegal_hits, phones, wechat_ids, qqs
+    if medical_hits:
+        # Business rule: once medical-ad keywords are recovered, treat the region
+        # as suspicious at minimum instead of leaving it below the suspicious floor.
+        score = max(score, config.suspicious_score)
+    return min(score, 100), sorted(set(hit_rules)), medical_hits, illegal_hits, phones, wechat_ids, qqs, attached_contact_indices
 
 
 def _as_blocks(records: list[OCRRecord] | list[OCRBlockInput]) -> list[OCRBlock]:
@@ -287,9 +552,16 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
     logger.info("evaluate_blocks request_id=%s groups_count=%s phones=%s global_noise_hits=%s", request_id, len(groups), sorted({phone for item in evidence_list for phone in item.phones}), sorted(global_noise_hits))
 
     for group_index, (region_points, region_bbox, items) in enumerate(groups, start=1):
-        score, hit_rules, medical_hits, illegal_hits, phones, wechat_ids, qqs = _score_candidate(items, global_noise_hits=global_noise_hits)
+        score, hit_rules, medical_hits, illegal_hits, phones, wechat_ids, qqs, attached_contact_indices = _score_candidate(
+            items,
+            all_items=evidence_list,
+            image=image,
+            request_id=request_id,
+            group_index=group_index,
+            global_noise_hits=global_noise_hits,
+        )
         logger.info(
-            "evaluate_blocks request_id=%s group=%s score=%s phones=%s medical_hits=%s illegal_hits=%s hit_rules=%s block_indices=%s",
+            "evaluate_blocks request_id=%s group=%s score=%s phones=%s medical_hits=%s illegal_hits=%s hit_rules=%s block_indices=%s attached_contact_indices=%s",
             request_id,
             group_index,
             score,
@@ -298,10 +570,11 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
             illegal_hits,
             hit_rules,
             [item.index for item in items],
+            attached_contact_indices,
         )
-        if not _is_suspicious_score(score, config, medical_hits, illegal_hits):
+        if not _should_keep_region(score, medical_hits, illegal_hits, phones, wechat_ids, qqs):
             logger.info(
-                "evaluate_blocks request_id=%s group=%s skipped reason=below_threshold suspicious_score=%s medical_hits=%s illegal_hits=%s",
+                "evaluate_blocks request_id=%s group=%s skipped reason=no_effective_signal suspicious_score=%s medical_hits=%s illegal_hits=%s",
                 request_id,
                 group_index,
                 config.suspicious_score,
@@ -309,7 +582,16 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
                 illegal_hits,
             )
             continue
-        refined_points, _ = _refine_region(items, region_points)
+        attached_contact_set = set(attached_contact_indices)
+        region_items = [
+            item
+            for item in items
+            if not collect_contact_items([item]) or item.index in attached_contact_set
+        ]
+        if not region_items:
+            region_items = items
+        region_items = _expand_region_with_nearby_hits(region_items, evidence_list)
+        refined_points, _ = _refine_region(region_items, region_points)
         refined_points, refined_bbox = _clip_region(refined_points, image.shape if image is not None else None)
         ad = AdRegion(
             ad_index=len(ads) + 1,
@@ -318,8 +600,8 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
             y1=refined_bbox[1],
             x2=refined_bbox[2],
             y2=refined_bbox[3],
-            block_indices=[item.index for item in items],
-            source_texts=[item.block.text for item in items],
+            block_indices=[item.index for item in region_items],
+            source_texts=[item.block.text for item in region_items],
             hit_keywords=sorted(set(medical_hits + illegal_hits)),
             hit_rules=hit_rules,
             phones=phones,
@@ -411,7 +693,7 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
         hit_rules=hit_rules,
         risk_score=risk_score,
         risk_level=_risk_level(risk_score, config),  # type: ignore[arg-type]
-        suspicious=bool(ads),
+        suspicious=any(ad.suspicious for ad in ads),
         ads=ads,
     )
 

@@ -27,6 +27,10 @@ def _line_color(block: OCRBlock) -> tuple[int, int, int]:
     return YELLOW
 
 
+def _draw_block(draw: ImageDraw.ImageDraw, block: OCRBlock, line_width: int) -> None:
+    draw.polygon([tuple(point) for point in block.points], outline=_line_color(block), width=line_width)
+
+
 def draw_annotations(image_path: Path, request_id: str, evaluation: RuleEvaluationResponse) -> Path | None:
     if not evaluation.suspicious:
         return None
@@ -38,10 +42,12 @@ def draw_annotations(image_path: Path, request_id: str, evaluation: RuleEvaluati
     line_width = max(settings.annotation.line_width, min(settings.annotation.line_width + 4, base // 180))
     font = _get_font(font_size)
 
-    for block in evaluation.ocr_blocks:
+    highlighted_indices = {index for ad in evaluation.ads for index in ad.block_indices}
+    for index, block in enumerate(evaluation.ocr_blocks):
         if not block.matched:
-            continue
-        draw.polygon([tuple(point) for point in block.points], outline=_line_color(block), width=line_width)
+            if index not in highlighted_indices:
+                continue
+        _draw_block(draw, block, line_width)
 
     for ad in evaluation.ads:
         draw.polygon([tuple(point) for point in ad.points], outline=RED, width=line_width + 1)
@@ -59,6 +65,6 @@ def draw_annotations(image_path: Path, request_id: str, evaluation: RuleEvaluati
         ratio = max_edge / float(max(image.width, image.height))
         image = image.resize((int(image.width * ratio), int(image.height * ratio)))
 
-    output_path = settings.runtime.output_dir / f"{request_id}.jpg"
-    image.save(output_path, format="JPEG", quality=settings.annotation.quality, optimize=True)
+    output_path = settings.runtime.output_dir / f"{request_id}.png"
+    image.save(output_path, format="PNG", optimize=True)
     return output_path

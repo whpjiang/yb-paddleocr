@@ -538,6 +538,33 @@ def _enhance_crop(crop: np.ndarray) -> np.ndarray:
     return processed
 
 
+def _expanded_focus_bbox(image: np.ndarray, selection: FocusRegionSelection, variant: RetryVariant) -> tuple[int, int, int, int]:
+    bbox = selection.bbox
+    if variant in {"rotate_180", "rotate_90", "rotate_270"} and selection.card_candidate is not None:
+        card_bbox = selection.card_candidate.bbox
+        bbox = (
+            min(bbox[0], card_bbox[0]),
+            min(bbox[1], card_bbox[1]),
+            max(bbox[2], card_bbox[2]),
+            max(bbox[3], card_bbox[3]),
+        )
+
+    width = max(1, bbox[2] - bbox[0])
+    height = max(1, bbox[3] - bbox[1])
+    if variant == "rotate_180":
+        padding_x = max(12, int(width * 0.10))
+        padding_top = max(8, int(height * 0.04))
+        padding_bottom = max(20, int(height * 0.28))
+        expanded = (bbox[0] - padding_x, bbox[1] - padding_top, bbox[2] + padding_x, bbox[3] + padding_bottom)
+    elif variant in {"rotate_90", "rotate_270"}:
+        padding_x = max(12, int(width * 0.14))
+        padding_y = max(12, int(height * 0.14))
+        expanded = (bbox[0] - padding_x, bbox[1] - padding_y, bbox[2] + padding_x, bbox[3] + padding_y)
+    else:
+        expanded = bbox
+    return _clip_bbox(expanded, image.shape)
+
+
 def _build_crop_candidate(image: np.ndarray, bbox: tuple[int, int, int, int], variant: RetryVariant) -> OCRCandidate | None:
     settings = get_settings()
     crop = image[bbox[1] : bbox[3], bbox[0] : bbox[2]]
@@ -619,7 +646,7 @@ def _build_perspective_candidate(selection: FocusRegionSelection) -> OCRCandidat
 
 def build_focus_retry_candidate(image: np.ndarray, focus_region: FocusRegionSelection, variant: RetryVariant) -> OCRCandidate | None:
     if variant in {"normal", "mirrored", "rotate_90", "rotate_180", "rotate_270"}:
-        return _build_crop_candidate(image, focus_region.bbox, variant)
+        return _build_crop_candidate(image, _expanded_focus_bbox(image, focus_region, variant), variant)
     if variant == "deskew":
         return _build_deskew_candidate(image, focus_region)
     if variant == "perspective":
