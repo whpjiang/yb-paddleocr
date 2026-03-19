@@ -1,0 +1,41 @@
+app:
+  name: medical-ad-ocr-tools
+  version: 0.1.0
+
+runtime:
+  temp_dir: storage/tmp
+  output_dir: storage/annotated
+  request_timeout_seconds: 15
+
+ocr:
+  lang: ch
+  version: PP-OCRv5
+  use_textline_orientation: false
+  text_detection_model_name: PP-OCRv5_mobile_det
+  text_recognition_model_name: PP-OCRv5_server_rec
+  text_detection_model_dir: models/ocr/PP-OCRv5_mobile_det
+  text_recognition_model_dir: models/ocr/PP-OCRv5_server_rec
+  textline_orientation_model_dir:
+  text_det_limit_side_len: 960
+  text_det_box_thresh: 0.45
+  text_det_thresh: 0.25
+  text_det_unclip_ratio: 1.5
+  text_rec_score_thresh: 0.3
+
+annotation:
+  quality: 82
+  max_edge: 1800
+  line_width: 4
+  font_size_min: 20
+  font_size_max: 42
+
+oss:
+  enabled: false
+  endpoint:
+  bucket_name:
+  access_key_id:
+  access_key_secret:
+  prefix: medical-ad-ocr-tools
+  public_base_url:
+
+rules_path: config/rules.yaml

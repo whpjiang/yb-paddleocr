@@ -1,0 +1,95 @@
+medical_keywords:
+  - 医保
+  - 医保卡
+  - 统筹
+  - 报销
+  - 门诊统筹
+  - 住院报销
+  - 特药
+  - 双通道
+  - 收药
+  - 高价收药
+  - 药品回收
+
+illegal_keywords:
+  - 套现
+  - 取现
+  - 提现
+  - 回收
+  - 高价回收
+  - 收药
+  - 高价收药
+  - 药品回收
+  - 帮办
+  - 代办
+  - 秒到账
+  - 现金结算
+
+contact_keywords:
+  - 电话
+  - 手机
+  - 微信
+  - vx
+  - VX
+  - qq
+  - QQ
+  - 联系
+
+noise_keywords:
+  - 租房
+  - 出租
+  - 招租
+  - 出售
+  - 售房
+  - 房屋
+  - 公寓
+  - 写字楼
+  - 招聘
+  - 招工
+  - 求职
+  - 兼职
+  - 家政
+  - 搬家
+  - 开锁
+  - 疏通
+  - 维修
+  - 收车
+  - 二手车
+
+medical_aliases:
+  医保卡:
+    - 医保咔
+    - 医保长
+
+illegal_aliases:
+  提现:
+    - 提镜
+    - 提现秒到
+  收药:
+    - 收藥
+
+phone_pattern: "(?<!\\d)(1[3-9][0-9\\-\\s]{9,15})(?!\\d)"
+wechat_pattern: "(?:微信|vx|V[Xx]|wechat)[:：\\s]*([a-zA-Z][-_a-zA-Z0-9]{5,19})"
+qq_pattern: "(?:qq|QQ)[:：\\s]*([1-9][0-9]{4,11})"
+
+suspicious_score: 45
+high_risk_score: 80
+group_limit_x_ratio: 2.2
+group_limit_y_ratio: 5.0
+region_padding_x_ratio: 0.18
+region_padding_y_ratio: 0.20
+min_region_padding: 12
+
+scores:
+  medical_base: 12
+  medical_per_hit: 6
+  medical_cap: 35
+  illegal_base: 15
+  illegal_per_hit: 8
+  illegal_cap: 40
+  phone: 24
+  wechat: 18
+  qq: 16
+  medical_with_contact: 20
+  illegal_multi_bonus: 10
+  phone_only_floor: 48
