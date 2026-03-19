@@ -36,6 +36,16 @@ class OCRConfig(BaseModel):
     text_det_thresh: float = 0.25
     text_det_unclip_ratio: float = 1.6
     text_rec_score_thresh: float = 0.3
+    focus_retry_enabled: bool = True
+    focus_retry_max_regions: int = 1
+    focus_retry_scale: float = 1.8
+    focus_retry_min_region_score: float = 0.55
+    focus_retry_min_keyword_hits: int = 2
+    focus_retry_mid_risk_min: int = 40
+    focus_retry_mid_risk_max: int = 69
+    focus_retry_enable_sharpen: bool = True
+    focus_retry_enable_contrast: bool = True
+    focus_retry_enable_rotate: bool = False
 
 
 class AnnotationConfig(BaseModel):
@@ -85,6 +95,16 @@ class Settings(BaseModel):
             text_det_thresh=self.ocr.text_det_thresh,
             text_det_unclip_ratio=self.ocr.text_det_unclip_ratio,
             text_rec_score_thresh=self.ocr.text_rec_score_thresh,
+            focus_retry_enabled=self.ocr.focus_retry_enabled,
+            focus_retry_max_regions=self.ocr.focus_retry_max_regions,
+            focus_retry_scale=self.ocr.focus_retry_scale,
+            focus_retry_min_region_score=self.ocr.focus_retry_min_region_score,
+            focus_retry_min_keyword_hits=self.ocr.focus_retry_min_keyword_hits,
+            focus_retry_mid_risk_min=self.ocr.focus_retry_mid_risk_min,
+            focus_retry_mid_risk_max=self.ocr.focus_retry_mid_risk_max,
+            focus_retry_enable_sharpen=self.ocr.focus_retry_enable_sharpen,
+            focus_retry_enable_contrast=self.ocr.focus_retry_enable_contrast,
+            focus_retry_enable_rotate=self.ocr.focus_retry_enable_rotate,
             annotation_quality=self.annotation.quality,
             annotation_max_edge=self.annotation.max_edge,
             annotation_line_width=self.annotation.line_width,
@@ -141,6 +161,16 @@ def _apply_env_overrides(data: dict[str, Any]) -> dict[str, Any]:
         "MEDICAL_AD_TEXT_DET_THRESH": ("ocr.text_det_thresh", float),
         "MEDICAL_AD_TEXT_DET_UNCLIP_RATIO": ("ocr.text_det_unclip_ratio", float),
         "MEDICAL_AD_TEXT_REC_SCORE_THRESH": ("ocr.text_rec_score_thresh", float),
+        "MEDICAL_AD_FOCUS_RETRY_ENABLED": ("ocr.focus_retry_enabled", _parse_bool),
+        "MEDICAL_AD_FOCUS_RETRY_MAX_REGIONS": ("ocr.focus_retry_max_regions", int),
+        "MEDICAL_AD_FOCUS_RETRY_SCALE": ("ocr.focus_retry_scale", float),
+        "MEDICAL_AD_FOCUS_RETRY_MIN_REGION_SCORE": ("ocr.focus_retry_min_region_score", float),
+        "MEDICAL_AD_FOCUS_RETRY_MIN_KEYWORD_HITS": ("ocr.focus_retry_min_keyword_hits", int),
+        "MEDICAL_AD_FOCUS_RETRY_MID_RISK_MIN": ("ocr.focus_retry_mid_risk_min", int),
+        "MEDICAL_AD_FOCUS_RETRY_MID_RISK_MAX": ("ocr.focus_retry_mid_risk_max", int),
+        "MEDICAL_AD_FOCUS_RETRY_ENABLE_SHARPEN": ("ocr.focus_retry_enable_sharpen", _parse_bool),
+        "MEDICAL_AD_FOCUS_RETRY_ENABLE_CONTRAST": ("ocr.focus_retry_enable_contrast", _parse_bool),
+        "MEDICAL_AD_FOCUS_RETRY_ENABLE_ROTATE": ("ocr.focus_retry_enable_rotate", _parse_bool),
         "MEDICAL_AD_ANNOTATION_QUALITY": ("annotation.quality", int),
         "MEDICAL_AD_ANNOTATION_MAX_EDGE": ("annotation.max_edge", int),
         "MEDICAL_AD_ANNOTATION_LINE_WIDTH": ("annotation.line_width", int),

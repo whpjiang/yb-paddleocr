@@ -4,9 +4,9 @@
 
 ## 特性
 
-- 支持图片上传和图片 URL 两种输入方式
+- 当前通过 `image_url` 接收待识别图片
 - 基于 `PaddleOCR 3.4.0` 提取全文、文字框和置信度
-- 保留多候选裁剪、多区域聚合、多小广告识别能力
+- 保留多小广告区域识别输出能力
 - 提取手机号、微信号、QQ 号等线索
 - 输出命中关键词、命中规则、风险分、风险等级和疑似标记
 - 对命中风险区域进行标注并压缩后上传到阿里云 OSS
@@ -126,21 +126,9 @@ C:\Users\<user>\.paddlex\official_models\PP-OCRv5_mobile_rec
 }
 ```
 
-返回字段包含：
+详细参数说明、响应字段说明和业务对接示例见：
 
-- `ocr_text`
-- `ocr_blocks`
-- `phones`
-- `wechat_ids`
-- `qqs`
-- `hit_keywords`
-- `hit_rules`
-- `risk_score`
-- `risk_level`
-- `suspicious`
-- `annotated_image_url`
-- `annotated_image_oss_key`
-- `ads`
+- [docs/api-integration.md](/d:/Workspace/LearnAI/yb-PaddleOCR/docs/api-integration.md)
 
 ### `POST /tools/medical-ad/rule/evaluate`
 
@@ -171,3 +159,4 @@ docker run --rm -p 8000:8000 --env-file .env medical-ad-ocr-tools
 - 当前实现不接入 MySQL、Redis、Celery，也不集成千问视觉模型。
 - 服务保留多个小广告区域识别输出，整体结果和每个广告区域结果都会返回。
 - `PaddleOCR 3.4.0` 在服务启动时会预热并下载缺失模型，首次启动会更慢，但可以避免首个请求承担模型初始化成本。
+- OCR 流程已改为“首轮全量 + 单区域重点增强”的两阶段方案，以降低 CPU 耗时。

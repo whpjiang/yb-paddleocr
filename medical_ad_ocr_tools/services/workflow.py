@@ -20,9 +20,9 @@ def analyze_image(request_id: str, image_path: Path, image_source: str) -> Workf
     if image is None:
         raise ValueError(f"Unable to read image: {image_path}")
 
-    ocr_records, avg_confidence, ocr_text = run_ocr(image_path)
-    evaluation = evaluate_blocks(blocks=_records_to_blocks(ocr_records), image=image, request_id=request_id)
-    evaluation.ocr_text = ocr_text
+    ocr_result = run_ocr(image_path, request_id=request_id)
+    evaluation = evaluate_blocks(blocks=_records_to_blocks(ocr_result.records), image=image, request_id=request_id)
+    evaluation.ocr_text = ocr_result.ocr_text
 
     annotated_image_path = draw_annotations(image_path=image_path, request_id=request_id, evaluation=evaluation)
     annotated_image_url, annotated_image_oss_key = (None, None)
@@ -33,7 +33,7 @@ def analyze_image(request_id: str, image_path: Path, image_source: str) -> Workf
         request_id=request_id,
         image_source=image_source,
         ocr_text=evaluation.ocr_text,
-        ocr_confidence=avg_confidence,
+        ocr_confidence=ocr_result.avg_confidence,
         ocr_blocks=evaluation.ocr_blocks,
         phones=evaluation.phones,
         wechat_ids=evaluation.wechat_ids,
@@ -44,6 +44,10 @@ def analyze_image(request_id: str, image_path: Path, image_source: str) -> Workf
         risk_level=evaluation.risk_level,
         suspicious=evaluation.suspicious,
         ads=evaluation.ads,
+        round1_triggered_focus_retry=ocr_result.round1_triggered_focus_retry,
+        focus_retry_reason=ocr_result.focus_retry_reason,
+        focus_region=ocr_result.focus_region,
+        focus_retry_added_boxes=ocr_result.focus_retry_added_boxes,
         annotated_image_url=annotated_image_url,
         annotated_image_oss_key=annotated_image_oss_key,
     )

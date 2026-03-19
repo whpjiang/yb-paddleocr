@@ -63,6 +63,14 @@ class AdRegion(BaseModel):
     suspicious: bool = False
 
 
+class FocusRegion(BaseModel):
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    score: float
+
+
 class RuleEvaluationResponse(BaseModel):
     request_id: str
     ocr_text: str
@@ -81,6 +89,10 @@ class RuleEvaluationResponse(BaseModel):
 class AnalyzeResponse(RuleEvaluationResponse):
     image_source: str
     ocr_confidence: float
+    round1_triggered_focus_retry: bool = False
+    focus_retry_reason: str = ""
+    focus_region: FocusRegion | None = None
+    focus_retry_added_boxes: int = 0
     annotated_image_url: str | None = None
     annotated_image_oss_key: str | None = None
 
@@ -95,6 +107,16 @@ class OCRRecord(BaseModel):
     text: str
     points: list[list[int]]
     confidence: float
+
+
+class OCRRunResult(BaseModel):
+    records: list[OCRRecord]
+    avg_confidence: float
+    ocr_text: str
+    round1_triggered_focus_retry: bool = False
+    focus_retry_reason: str = ""
+    focus_region: FocusRegion | None = None
+    focus_retry_added_boxes: int = 0
 
 
 class AnalyzeArtifacts(BaseModel):
@@ -150,6 +172,16 @@ class FlatConfig(BaseModel):
     text_det_thresh: float
     text_det_unclip_ratio: float
     text_rec_score_thresh: float
+    focus_retry_enabled: bool
+    focus_retry_max_regions: int
+    focus_retry_scale: float
+    focus_retry_min_region_score: float
+    focus_retry_min_keyword_hits: int
+    focus_retry_mid_risk_min: int
+    focus_retry_mid_risk_max: int
+    focus_retry_enable_sharpen: bool
+    focus_retry_enable_contrast: bool
+    focus_retry_enable_rotate: bool
     annotation_quality: int
     annotation_max_edge: int
     annotation_line_width: int

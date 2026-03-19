@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -9,9 +10,10 @@ import cv2
 import numpy as np
 from paddleocr import PaddleOCR
 
-from medical_ad_ocr_tools.core.models import OCRRecord
+from medical_ad_ocr_tools.core.models import FocusRegion, OCRBlock, OCRRecord, OCRRunResult, RuleEvaluationResponse
 from medical_ad_ocr_tools.core.settings import get_settings
-from medical_ad_ocr_tools.services.card_detector import CardCandidate, detect_card_candidates
+from medical_ad_ocr_tools.services.card_detector import detect_card_candidates
+from medical_ad_ocr_tools.services.rule_service import evaluate_blocks, get_rule_config
 
 
 @dataclass
@@ -24,7 +26,24 @@ class OCRCandidate:
     crop_height: int
     scale: float
     rotation: int = 0
-    inverse_perspective_matrix: list[list[float]] | None = None
+
+
+@dataclass
+class FocusRegionCandidate:
+    bbox: tuple[int, int, int, int]
+    score: float
+    block_indices: list[int]
+
+
+@dataclass
+class Round1Analysis:
+    evaluation: RuleEvaluationResponse
+    box_count: int
+    total_text_length: int
+    high_risk_keyword_hits: int
+    has_complete_contact: bool
+    has_partial_contact: bool
+    has_card_candidate: bool
 
 
 @lru_cache(maxsize=1)
@@ -55,17 +74,6 @@ def get_ocr_engine() -> PaddleOCR:
     return PaddleOCR(**kwargs)
 
 
-def _enhance_image(image: np.ndarray) -> np.ndarray:
-    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
-    l_channel = clahe.apply(l_channel)
-    merged = cv2.merge((l_channel, a_channel, b_channel))
-    enhanced = cv2.cvtColor(merged, cv2.COLOR_LAB2BGR)
-    kernel = np.array([[0, -1, 0], [-1, 5.2, -1], [0, -1, 0]], dtype=np.float32)
-    return cv2.filter2D(enhanced, -1, kernel)
-
-
 def _make_candidate(
     crop: np.ndarray,
     name: str,
@@ -73,11 +81,9 @@ def _make_candidate(
     offset_y: int,
     *,
     scale: float = 1.0,
-    enhance: bool = False,
     rotation: int = 0,
-    inverse_perspective_matrix: list[list[float]] | None = None,
 ) -> OCRCandidate:
-    processed = _enhance_image(crop) if enhance else crop.copy()
+    processed = crop.copy()
     if scale != 1.0:
         processed = cv2.resize(processed, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
     if rotation == 90:
@@ -93,7 +99,6 @@ def _make_candidate(
         crop_height=crop.shape[0],
         scale=scale,
         rotation=rotation,
-        inverse_perspective_matrix=inverse_perspective_matrix,
     )
 
 
@@ -105,17 +110,8 @@ def _build_initial_candidates(image: np.ndarray) -> list[OCRCandidate]:
     return candidates
 
 
-def _clip_bbox(bbox: tuple[int, int, int, int], image_shape: tuple[int, int, int]) -> tuple[int, int, int, int]:
-    height, width = image_shape[:2]
-    x1 = min(max(0, bbox[0]), width - 1)
-    y1 = min(max(0, bbox[1]), height - 1)
-    x2 = min(max(x1 + 1, bbox[2]), width)
-    y2 = min(max(y1 + 1, bbox[3]), height)
-    return x1, y1, x2, y2
-
-
 def _map_points(candidate: OCRCandidate, points: list[list[float]]) -> list[list[int]]:
-    transformed_points: list[list[float]] = []
+    mapped: list[list[int]] = []
     for point in points:
         scaled_x = point[0] / candidate.scale
         scaled_y = point[1] / candidate.scale
@@ -125,21 +121,23 @@ def _map_points(candidate: OCRCandidate, points: list[list[float]]) -> list[list
             crop_x, crop_y = candidate.crop_width - scaled_y, scaled_x
         else:
             crop_x, crop_y = scaled_x, scaled_y
-        transformed_points.append([crop_x, crop_y])
-
-    if candidate.inverse_perspective_matrix is not None:
-        matrix = np.array(candidate.inverse_perspective_matrix, dtype=np.float32)
-        src = np.array(transformed_points, dtype=np.float32).reshape(-1, 1, 2)
-        dst = cv2.perspectiveTransform(src, matrix).reshape(-1, 2)
-        return [[int(round(x)), int(round(y))] for x, y in dst]
-
-    return [[int(round(x + candidate.offset_x)), int(round(y + candidate.offset_y))] for x, y in transformed_points]
+        mapped.append([int(round(crop_x + candidate.offset_x)), int(round(crop_y + candidate.offset_y))])
+    return mapped
 
 
 def _bbox(points: list[list[int]]) -> tuple[int, int, int, int]:
     xs = [point[0] for point in points]
     ys = [point[1] for point in points]
     return min(xs), min(ys), max(xs), max(ys)
+
+
+def _clip_bbox(bbox: tuple[int, int, int, int], image_shape: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    height, width = image_shape[:2]
+    x1 = min(max(0, bbox[0]), width - 1)
+    y1 = min(max(0, bbox[1]), height - 1)
+    x2 = min(max(x1 + 1, bbox[2]), width)
+    y2 = min(max(y1 + 1, bbox[3]), height)
+    return x1, y1, x2, y2
 
 
 def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
@@ -155,6 +153,14 @@ def _iou(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> float:
     return inter / float(area_a + area_b - inter)
 
 
+def _center_close(a: tuple[int, int, int, int], b: tuple[int, int, int, int], threshold: int = 24) -> bool:
+    return abs((a[0] + a[2]) - (b[0] + b[2])) <= threshold and abs((a[1] + a[3]) - (b[1] + b[3])) <= threshold
+
+
+def _normalize_text(text: str) -> str:
+    return "".join(char for char in text.lower() if char.isalnum())
+
+
 def _similar_text(a: str, b: str) -> bool:
     if not a or not b:
         return False
@@ -167,8 +173,12 @@ def _similar_text(a: str, b: str) -> bool:
     return overlap / max(1, len(short)) >= 0.65
 
 
-def _normalize_text(text: str) -> str:
-    return "".join(char for char in text.lower() if char.isalnum())
+def _prefer_record(candidate: OCRRecord, existing: OCRRecord) -> bool:
+    candidate_text = _normalize_text(candidate.text)
+    existing_text = _normalize_text(existing.text)
+    candidate_score = (len(candidate_text), candidate.confidence)
+    existing_score = (len(existing_text), existing.confidence)
+    return candidate_score > existing_score
 
 
 def _deduplicate(records: list[OCRRecord]) -> list[OCRRecord]:
@@ -176,21 +186,21 @@ def _deduplicate(records: list[OCRRecord]) -> list[OCRRecord]:
     for record in sorted(records, key=lambda item: item.confidence, reverse=True):
         current_bbox = _bbox(record.points)
         current_text = _normalize_text(record.text)
-        duplicate = False
-        for kept in deduped:
+        duplicate_index = -1
+        for index, kept in enumerate(deduped):
             kept_bbox = _bbox(kept.points)
             kept_text = _normalize_text(kept.text)
-            center_close = abs((current_bbox[0] + current_bbox[2]) - (kept_bbox[0] + kept_bbox[2])) <= 24 and abs(
-                (current_bbox[1] + current_bbox[3]) - (kept_bbox[1] + kept_bbox[3])
-            ) <= 24
-            if current_text and kept_text and current_text == kept_text and (_iou(current_bbox, kept_bbox) >= 0.25 or center_close):
-                duplicate = True
+            if current_text and kept_text and current_text == kept_text and (_iou(current_bbox, kept_bbox) >= 0.25 or _center_close(current_bbox, kept_bbox)):
+                duplicate_index = index
                 break
-            if _similar_text(current_text, kept_text) and (_iou(current_bbox, kept_bbox) >= 0.5 or center_close):
-                duplicate = True
+            if _similar_text(current_text, kept_text) and (_iou(current_bbox, kept_bbox) >= 0.5 or _center_close(current_bbox, kept_bbox)):
+                duplicate_index = index
                 break
-        if not duplicate:
-            deduped.append(record)
+        if duplicate_index >= 0:
+            if _prefer_record(record, deduped[duplicate_index]):
+                deduped[duplicate_index] = record
+            continue
+        deduped.append(record)
     return deduped
 
 
@@ -229,142 +239,234 @@ def _predict_candidate(engine: PaddleOCR, candidate: OCRCandidate, use_textline_
     pages = result if len(result) != 1 else [result[0]]
     for page in pages:
         for points, text, confidence in _iter_result_items(page):
-            if not text:
-                continue
-            records.append(
-                OCRRecord(
-                    points=_map_points(candidate, points),
-                    text=text,
-                    confidence=confidence,
-                )
-            )
+            if text:
+                records.append(OCRRecord(points=_map_points(candidate, points), text=text, confidence=confidence))
     return records
 
 
-def _build_focus_regions(
-    image: np.ndarray,
-    records: list[OCRRecord],
-    card_candidates: list[CardCandidate],
-) -> list[tuple[str, tuple[int, int, int, int], list[list[float]] | None]]:
-    regions: list[tuple[str, tuple[int, int, int, int], list[list[float]] | None]] = []
-    text_boxes = [_bbox(record.points) for record in records]
-    used: set[int] = set()
+def _records_to_blocks(records: list[OCRRecord]) -> list[OCRBlock]:
+    return [OCRBlock(text=item.text, points=item.points, confidence=item.confidence) for item in records]
 
-    for index, box in enumerate(text_boxes):
+
+def _has_partial_contact(evaluation: RuleEvaluationResponse) -> bool:
+    if evaluation.phones or evaluation.wechat_ids:
+        return False
+    phone_hint = re.compile(r"1[3-9][0-9\-\s]{5,}")
+    wechat_hint = re.compile(r"(微信|vx|V[Xx]|wechat)", re.IGNORECASE)
+    qq_hint = re.compile(r"\b(QQ|qq)\b")
+    return any(phone_hint.search(block.text) or wechat_hint.search(block.text) or qq_hint.search(block.text) for block in evaluation.ocr_blocks)
+
+
+def _build_round1_analysis(image: np.ndarray, records: list[OCRRecord], request_id: str) -> Round1Analysis:
+    evaluation = evaluate_blocks(blocks=_records_to_blocks(records), image=image, request_id=request_id)
+    return Round1Analysis(
+        evaluation=evaluation,
+        box_count=len(evaluation.ocr_blocks),
+        total_text_length=sum(len(block.text.strip()) for block in evaluation.ocr_blocks),
+        high_risk_keyword_hits=len(evaluation.hit_keywords),
+        has_complete_contact=bool(evaluation.phones or evaluation.wechat_ids),
+        has_partial_contact=_has_partial_contact(evaluation),
+        has_card_candidate=bool(detect_card_candidates(image)),
+    )
+
+
+def should_run_focus_retry(round1_analysis: Round1Analysis) -> str:
+    settings = get_settings()
+    if not settings.ocr.focus_retry_enabled:
+        return ""
+    evaluation = round1_analysis.evaluation
+    if round1_analysis.high_risk_keyword_hits >= settings.ocr.focus_retry_min_keyword_hits and not round1_analysis.has_complete_contact:
+        return "high_risk_keywords_missing_contact"
+    if (
+        round1_analysis.box_count <= 4
+        and round1_analysis.total_text_length <= 36
+        and round1_analysis.high_risk_keyword_hits >= 1
+    ):
+        return "sparse_text_with_risk_words"
+    if (
+        settings.ocr.focus_retry_mid_risk_min <= evaluation.risk_score <= settings.ocr.focus_retry_mid_risk_max
+        and round1_analysis.has_card_candidate
+    ):
+        return "mid_risk_with_card_region"
+    return ""
+
+
+def _cluster_boxes(boxes: list[OCRBlock]) -> list[list[int]]:
+    clusters: list[list[int]] = []
+    used: set[int] = set()
+    bboxes = [_bbox(block.points) for block in boxes]
+
+    for index, box in enumerate(bboxes):
         if index in used:
             continue
-        selected = {index}
-        x1, y1, x2, y2 = box
-        box_w = max(20, x2 - x1)
-        box_h = max(20, y2 - y1)
-        limit_x = max(80, int(box_w * 2.4))
-        limit_y = max(120, int(box_h * 5.0))
-        center_x = (x1 + x2) / 2
-        center_y = (y1 + y2) / 2
-
-        for other_index, other in enumerate(text_boxes):
-            if other_index == index:
-                continue
-            ox1, oy1, ox2, oy2 = other
-            other_center_x = (ox1 + ox2) / 2
-            other_center_y = (oy1 + oy2) / 2
-            if abs(other_center_x - center_x) <= limit_x and abs(other_center_y - center_y) <= limit_y:
-                selected.add(other_index)
-
-        merged = (
-            min(text_boxes[item][0] for item in selected),
-            min(text_boxes[item][1] for item in selected),
-            max(text_boxes[item][2] for item in selected),
-            max(text_boxes[item][3] for item in selected),
-        )
-        padding_x = max(20, int((merged[2] - merged[0]) * 0.22))
-        padding_y = max(24, int((merged[3] - merged[1]) * 0.28))
-        clipped = _clip_bbox((merged[0] - padding_x, merged[1] - padding_y, merged[2] + padding_x, merged[3] + padding_y), image.shape)
-        duplicate = False
-        for _, existing, _ in regions:
-            if _iou(existing, clipped) >= 0.45:
-                duplicate = True
-                break
-        if not duplicate and (clipped[2] - clipped[0]) >= 48 and (clipped[3] - clipped[1]) >= 48:
-            regions.append((f"text_{index}", clipped, None))
-            used.update(selected)
-
-    for index, card in enumerate(card_candidates):
-        clipped = _clip_bbox(card.bbox, image.shape)
-        duplicate = False
-        for _, existing, _ in regions:
-            if _iou(existing, clipped) >= 0.5:
-                duplicate = True
-                break
-        if not duplicate:
-            regions.append((f"card_{index}", clipped, card.inverse_perspective_matrix))
-
-    regions.sort(key=lambda item: (item[1][2] - item[1][0]) * (item[1][3] - item[1][1]), reverse=True)
-    return regions[:4]
+        cluster = {index}
+        queue = [index]
+        while queue:
+            current = queue.pop()
+            cx1, cy1, cx2, cy2 = bboxes[current]
+            current_center_x = (cx1 + cx2) / 2
+            current_center_y = (cy1 + cy2) / 2
+            current_w = max(20, cx2 - cx1)
+            current_h = max(20, cy2 - cy1)
+            limit_x = max(70, int(current_w * 2.4))
+            limit_y = max(120, int(current_h * 4.8))
+            for other_index, other in enumerate(bboxes):
+                if other_index in cluster:
+                    continue
+                ox1, oy1, ox2, oy2 = other
+                other_center_x = (ox1 + ox2) / 2
+                other_center_y = (oy1 + oy2) / 2
+                if abs(other_center_x - current_center_x) <= limit_x and abs(other_center_y - current_center_y) <= limit_y:
+                    cluster.add(other_index)
+                    queue.append(other_index)
+        clusters.append(sorted(cluster))
+        used.update(cluster)
+    return clusters
 
 
-def _build_targeted_candidates(
+def _score_focus_region(
     image: np.ndarray,
-    records: list[OCRRecord],
-    card_candidates: list[CardCandidate],
-) -> list[OCRCandidate]:
-    candidates: list[OCRCandidate] = []
+    boxes: list[OCRBlock],
+    block_indices: list[int],
+) -> FocusRegionCandidate | None:
+    config = get_rule_config()
+    selected = [boxes[index] for index in block_indices]
+    merged = (
+        min(_bbox(block.points)[0] for block in selected),
+        min(_bbox(block.points)[1] for block in selected),
+        max(_bbox(block.points)[2] for block in selected),
+        max(_bbox(block.points)[3] for block in selected),
+    )
+    padding_x = max(config.min_region_padding, int((merged[2] - merged[0]) * config.region_padding_x_ratio))
+    padding_y = max(config.min_region_padding, int((merged[3] - merged[1]) * config.region_padding_y_ratio))
+    bbox = _clip_bbox((merged[0] - padding_x, merged[1] - padding_y, merged[2] + padding_x, merged[3] + padding_y), image.shape)
+    width = bbox[2] - bbox[0]
+    height = bbox[3] - bbox[1]
+    if width < 48 or height < 48:
+        return None
 
-    for name, bbox, _ in _build_focus_regions(image, records, card_candidates):
-        x1, y1, x2, y2 = bbox
-        crop = image[y1:y2, x1:x2]
-        if crop.size == 0:
+    keyword_hits = sum(len(block.hit_keywords) for block in selected)
+    contact_hits = sum(sum(1 for item in block.clue_types if item in {"phone", "wechat", "qq"}) for block in selected)
+    if contact_hits == 0:
+        contact_hits = sum(1 for block in selected if re.search(r"(微信|vx|V[Xx]|wechat|QQ|qq|手机|电话)", block.text, re.IGNORECASE))
+    text_area = sum(max(1, (_bbox(block.points)[2] - _bbox(block.points)[0]) * (_bbox(block.points)[3] - _bbox(block.points)[1])) for block in selected)
+    region_area = max(1, width * height)
+    density = min(1.0, text_area / region_area * 2.5)
+    aspect_ratio = width / max(height, 1)
+    shape_score = max(0.0, 1.0 - min(abs(np.log(max(aspect_ratio, 1e-6))) / 1.2, 1.0))
+    line_score = min(1.0, len(selected) / 4.0)
+    keyword_score = min(1.0, keyword_hits / 3.0)
+    contact_score = min(1.0, contact_hits / 3.0)
+    score = round(keyword_score * 0.35 + contact_score * 0.25 + density * 0.15 + shape_score * 0.10 + line_score * 0.15, 4)
+    return FocusRegionCandidate(bbox=bbox, score=score, block_indices=block_indices)
+
+
+def select_best_focus_region(image: np.ndarray, boxes: list[OCRBlock], analysis: Round1Analysis) -> FocusRegion | None:
+    settings = get_settings()
+    candidates: list[FocusRegionCandidate] = []
+    for cluster in _cluster_boxes(boxes):
+        candidate = _score_focus_region(image, boxes, cluster)
+        if candidate is None:
             continue
-        candidates.append(_make_candidate(crop, f"{name}_enhanced", x1, y1, scale=2.6, enhance=True))
-        if name.startswith("text_") and (y2 - y1) > (x2 - x1) * 1.25:
-            candidates.append(_make_candidate(crop, f"{name}_rot", x1, y1, scale=3.0, enhance=True, rotation=90))
+        if analysis.high_risk_keyword_hits and not any(boxes[index].hit_keywords for index in cluster):
+            continue
+        candidates.append(candidate)
 
-    for index, card in enumerate(card_candidates[:2]):
-        candidates.append(
-            _make_candidate(
-                card.crop,
-                f"card_warp_enhanced_{index}",
-                0,
-                0,
-                scale=3.0,
-                enhance=True,
-                inverse_perspective_matrix=card.inverse_perspective_matrix,
-            )
-        )
-        if card.crop.shape[0] > card.crop.shape[1] * 1.1:
-            candidates.append(
-                _make_candidate(
-                    card.crop,
-                    f"card_warp_rot_{index}",
-                    0,
-                    0,
-                    scale=3.2,
-                    enhance=True,
-                    rotation=90,
-                    inverse_perspective_matrix=card.inverse_perspective_matrix,
-                )
-            )
-    return candidates
+    candidates.sort(key=lambda item: item.score, reverse=True)
+    candidates = candidates[: settings.ocr.focus_retry_max_regions]
+    if not candidates:
+        return None
+    best = candidates[0]
+    if best.score < settings.ocr.focus_retry_min_region_score:
+        return None
+    return FocusRegion(x1=best.bbox[0], y1=best.bbox[1], x2=best.bbox[2], y2=best.bbox[3], score=best.score)
 
 
-def run_ocr(image_path: str | Path) -> tuple[list[OCRRecord], float, str]:
+def build_focus_retry_candidate(image: np.ndarray, focus_region: FocusRegion) -> OCRCandidate | None:
+    settings = get_settings()
+    bbox = _clip_bbox((focus_region.x1, focus_region.y1, focus_region.x2, focus_region.y2), image.shape)
+    crop = image[bbox[1] : bbox[3], bbox[0] : bbox[2]]
+    if crop.size == 0:
+        return None
+
+    processed = crop.copy()
+    if settings.ocr.focus_retry_enable_contrast:
+        processed = cv2.convertScaleAbs(processed, alpha=1.15, beta=4)
+    if settings.ocr.focus_retry_enable_sharpen:
+        kernel = np.array([[0, -1, 0], [-1, 5.0, -1], [0, -1, 0]], dtype=np.float32)
+        processed = cv2.filter2D(processed, -1, kernel)
+
+    rotation = 0
+    if settings.ocr.focus_retry_enable_rotate and crop.shape[0] > crop.shape[1] * 1.6:
+        rotation = 90
+    return _make_candidate(
+        processed,
+        name="focus_retry",
+        offset_x=bbox[0],
+        offset_y=bbox[1],
+        scale=settings.ocr.focus_retry_scale,
+        rotation=rotation,
+    )
+
+
+def merge_round1_and_focus(round1_boxes: list[OCRRecord], focus_boxes: list[OCRRecord]) -> list[OCRRecord]:
+    merged = list(round1_boxes)
+    for focus_box in focus_boxes:
+        focus_bbox = _bbox(focus_box.points)
+        duplicate_index = -1
+        for index, existing in enumerate(merged):
+            existing_bbox = _bbox(existing.points)
+            if _iou(focus_bbox, existing_bbox) >= 0.45 or _center_close(focus_bbox, existing_bbox, threshold=30):
+                duplicate_index = index
+                break
+        if duplicate_index >= 0:
+            if _prefer_record(focus_box, merged[duplicate_index]):
+                merged[duplicate_index] = focus_box
+            continue
+        merged.append(focus_box)
+    return _deduplicate(merged)
+
+
+def run_ocr(image_path: str | Path, request_id: str = "ocr-analyze") -> OCRRunResult:
     image = cv2.imread(str(image_path))
     if image is None:
         raise ValueError(f"Unable to read image: {image_path}")
 
     settings = get_settings()
     engine = get_ocr_engine()
-    card_candidates = detect_card_candidates(image)
 
-    boxes: list[OCRRecord] = []
+    round1_boxes: list[OCRRecord] = []
     for candidate in _build_initial_candidates(image):
-        boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+        round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+    round1_boxes = _deduplicate(round1_boxes)
 
-    first_pass_boxes = _deduplicate(boxes)
-    for candidate in _build_targeted_candidates(image, first_pass_boxes, card_candidates):
-        boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+    round1_analysis = _build_round1_analysis(image, round1_boxes, request_id)
+    retry_reason = should_run_focus_retry(round1_analysis)
+    focus_region = select_best_focus_region(image, round1_analysis.evaluation.ocr_blocks, round1_analysis) if retry_reason else None
 
-    boxes = _deduplicate(boxes)
-    boxes.sort(key=lambda item: (min(point[1] for point in item.points), min(point[0] for point in item.points)))
-    avg_confidence = round(sum(item.confidence for item in boxes) / len(boxes), 4) if boxes else 0.0
-    return boxes, avg_confidence, "\n".join(item.text for item in boxes)
+    final_boxes = list(round1_boxes)
+    focus_added_boxes = 0
+    if retry_reason and focus_region is not None:
+        retry_candidate = build_focus_retry_candidate(image, focus_region)
+        if retry_candidate is not None:
+            focus_boxes = _predict_candidate(engine, retry_candidate, settings.ocr.use_textline_orientation)
+            merged = merge_round1_and_focus(round1_boxes, focus_boxes)
+            focus_added_boxes = max(0, len(merged) - len(round1_boxes))
+            final_boxes = merged
+        else:
+            retry_reason = ""
+            focus_region = None
+    elif retry_reason:
+        retry_reason = ""
+
+    final_boxes.sort(key=lambda item: (min(point[1] for point in item.points), min(point[0] for point in item.points)))
+    avg_confidence = round(sum(item.confidence for item in final_boxes) / len(final_boxes), 4) if final_boxes else 0.0
+    return OCRRunResult(
+        records=final_boxes,
+        avg_confidence=avg_confidence,
+        ocr_text="\n".join(item.text for item in final_boxes),
+        round1_triggered_focus_retry=bool(retry_reason and focus_region is not None),
+        focus_retry_reason=retry_reason,
+        focus_region=focus_region,
+        focus_retry_added_boxes=focus_added_boxes,
+    )
