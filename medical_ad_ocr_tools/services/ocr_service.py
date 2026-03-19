@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -15,7 +16,8 @@ from medical_ad_ocr_tools.core.settings import get_settings
 from medical_ad_ocr_tools.services.card_detector import CardCandidate, detect_card_candidates
 from medical_ad_ocr_tools.services.rule_service import evaluate_blocks, get_rule_config
 
-RetryVariant = Literal["normal", "mirrored", "rotate_90", "rotate_270", "deskew", "perspective"]
+RetryVariant = Literal["normal", "mirrored", "rotate_90", "rotate_180", "rotate_270", "deskew", "perspective"]
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -234,6 +236,9 @@ def _map_points(candidate: OCRCandidate, points: list[list[float]]) -> list[list
         y = src_points[:, 1].copy()
         src_points[:, 0] = y
         src_points[:, 1] = candidate.crop_height - x
+    elif candidate.rotation_quadrants == 2:
+        src_points[:, 0] = candidate.crop_width - src_points[:, 0]
+        src_points[:, 1] = candidate.crop_height - src_points[:, 1]
     elif candidate.rotation_quadrants == 3:
         x = src_points[:, 0].copy()
         y = src_points[:, 1].copy()
@@ -389,6 +394,24 @@ def _shape_from_card(card: CardCandidate | None) -> tuple[float, str]:
     return angle, "rectangle"
 
 
+def _nearby_block_indices(boxes: list[OCRBlock], bbox: tuple[int, int, int, int]) -> list[int]:
+    x1, y1, x2, y2 = bbox
+    padding_x = max(12, int((x2 - x1) * 0.14))
+    padding_y = max(12, int((y2 - y1) * 0.14))
+    expanded = (x1 - padding_x, y1 - padding_y, x2 + padding_x, y2 + padding_y)
+    matched: list[int] = []
+    for index, block in enumerate(boxes):
+        block_bbox = _bbox(block.points)
+        center_x = (block_bbox[0] + block_bbox[2]) / 2
+        center_y = (block_bbox[1] + block_bbox[3]) / 2
+        if (
+            expanded[0] <= center_x <= expanded[2]
+            and expanded[1] <= center_y <= expanded[3]
+        ) or _iou(expanded, block_bbox) >= 0.08:
+            matched.append(index)
+    return matched
+
+
 def _estimate_shape_from_boxes(selected: list[OCRBlock]) -> tuple[float, str]:
     point_cloud = np.array([point for block in selected for point in block.points], dtype=np.float32)
     if len(point_cloud) < 4:
@@ -407,29 +430,38 @@ def _region_score(
     boxes: list[OCRBlock],
     block_indices: list[int],
     card_candidates: list[CardCandidate],
+    *,
+    analysis: Round1Analysis | None = None,
+    source: str = "text_cluster",
+    preset_bbox: tuple[int, int, int, int] | None = None,
+    preset_card: CardCandidate | None = None,
 ) -> FocusRegionSelection | None:
     selected = [boxes[index] for index in block_indices]
-    merged = (
-        min(_bbox(block.points)[0] for block in selected),
-        min(_bbox(block.points)[1] for block in selected),
-        max(_bbox(block.points)[2] for block in selected),
-        max(_bbox(block.points)[3] for block in selected),
-    )
-    width = max(1, merged[2] - merged[0])
-    height = max(1, merged[3] - merged[1])
-    padding_x = max(10, int(width * 0.08))
-    padding_y = max(12, int(height * 0.10))
-    bbox = _clip_bbox((merged[0] - padding_x, merged[1] - padding_y, merged[2] + padding_x, merged[3] + padding_y), image.shape)
+    if preset_bbox is not None:
+        bbox = _clip_bbox(preset_bbox, image.shape)
+    else:
+        merged = (
+            min(_bbox(block.points)[0] for block in selected),
+            min(_bbox(block.points)[1] for block in selected),
+            max(_bbox(block.points)[2] for block in selected),
+            max(_bbox(block.points)[3] for block in selected),
+        )
+        width = max(1, merged[2] - merged[0])
+        height = max(1, merged[3] - merged[1])
+        padding_x = max(10, int(width * 0.08))
+        padding_y = max(12, int(height * 0.10))
+        bbox = _clip_bbox((merged[0] - padding_x, merged[1] - padding_y, merged[2] + padding_x, merged[3] + padding_y), image.shape)
     if bbox[2] - bbox[0] < 48 or bbox[3] - bbox[1] < 48:
         return None
 
-    overlap_card = None
+    overlap_card = preset_card
     overlap_score = 0.0
-    for card in card_candidates:
-        score = _iou(bbox, card.bbox)
-        if score > overlap_score:
-            overlap_card = card
-            overlap_score = score
+    if overlap_card is None:
+        for card in card_candidates:
+            score = _iou(bbox, card.bbox)
+            if score > overlap_score:
+                overlap_card = card
+                overlap_score = score
 
     keyword_hits = sum(len(boxes[index].hit_keywords) for index in block_indices)
     contact_hits = sum(sum(1 for item in boxes[index].clue_types if item in {"phone", "wechat", "qq"}) for index in block_indices)
@@ -443,7 +475,20 @@ def _region_score(
     shape_score = {"rectangle": 1.0, "trapezoid": 0.9, "irregular": 0.55}.get(shape, 0.55)
     contact_score = min(1.0, (contact_hits + digit_hints) / 3.0)
     keyword_score = min(1.0, keyword_hits / 3.0)
-    score = round(keyword_score * 0.34 + contact_score * 0.24 + density * 0.14 + compactness * 0.12 + shape_score * 0.16 + card_bonus, 4)
+    area_bonus = 0.0
+    if overlap_card is not None:
+        card_area = max(1, (overlap_card.bbox[2] - overlap_card.bbox[0]) * (overlap_card.bbox[3] - overlap_card.bbox[1]))
+        area_bonus = min(0.12, card_area / max(region_area, 1) * 0.04)
+    score = keyword_score * 0.34 + contact_score * 0.24 + density * 0.14 + compactness * 0.12 + shape_score * 0.16 + card_bonus + area_bonus
+    if analysis is not None and analysis.low_semantic_confidence and source == "card_candidate":
+        score += 0.16
+    if analysis is not None and analysis.low_semantic_confidence and source == "text_cluster":
+        joined_text = "".join(boxes[index].text for index in block_indices)
+        if not keyword_hits and _noise_hits_for_text(joined_text):
+            score -= 0.18
+    if analysis is not None and analysis.has_complete_contact and not keyword_hits and overlap_card is not None and source == "card_candidate":
+        score += 0.08
+    score = round(max(0.0, min(1.0, score)), 4)
     return FocusRegionSelection(bbox=bbox, score=min(score, 1.0), block_indices=block_indices, angle=angle, shape=shape, card_candidate=overlap_card)
 
 
@@ -451,26 +496,27 @@ def select_best_focus_region(image: np.ndarray, boxes: list[OCRBlock], analysis:
     settings = get_settings()
     candidates: list[FocusRegionSelection] = []
     for cluster in _cluster_boxes(boxes):
-        candidate = _region_score(image, boxes, cluster, analysis.card_candidates)
+        candidate = _region_score(image, boxes, cluster, analysis.card_candidates, analysis=analysis, source="text_cluster")
         if candidate is None:
             continue
         if analysis.high_risk_keyword_hits and not any(boxes[index].hit_keywords for index in cluster) and not any(re.search(r"\d{6,}", boxes[index].text) for index in cluster):
             continue
         candidates.append(candidate)
 
-    if analysis.card_candidates and not candidates:
-        for card in analysis.card_candidates[: settings.ocr.focus_retry_max_regions]:
-            angle, shape = _shape_from_card(card)
-            candidates.append(
-                FocusRegionSelection(
-                    bbox=card.bbox,
-                    score=0.62,
-                    block_indices=[],
-                    angle=angle,
-                    shape=shape,
-                    card_candidate=card,
-                )
-            )
+    for card in analysis.card_candidates:
+        nearby_indices = _nearby_block_indices(boxes, card.bbox)
+        candidate = _region_score(
+            image,
+            boxes,
+            nearby_indices,
+            analysis.card_candidates,
+            analysis=analysis,
+            source="card_candidate",
+            preset_bbox=card.bbox,
+            preset_card=card,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
 
     candidates.sort(key=lambda item: item.score, reverse=True)
     if not candidates:
@@ -505,6 +551,9 @@ def _build_crop_candidate(image: np.ndarray, bbox: tuple[int, int, int, int], va
     elif variant == "rotate_90":
         processed = cv2.rotate(processed, cv2.ROTATE_90_CLOCKWISE)
         rotation_quadrants = 1
+    elif variant == "rotate_180":
+        processed = cv2.rotate(processed, cv2.ROTATE_180)
+        rotation_quadrants = 2
     elif variant == "rotate_270":
         processed = cv2.rotate(processed, cv2.ROTATE_90_COUNTERCLOCKWISE)
         rotation_quadrants = 3
@@ -569,7 +618,7 @@ def _build_perspective_candidate(selection: FocusRegionSelection) -> OCRCandidat
 
 
 def build_focus_retry_candidate(image: np.ndarray, focus_region: FocusRegionSelection, variant: RetryVariant) -> OCRCandidate | None:
-    if variant in {"normal", "mirrored", "rotate_90", "rotate_270"}:
+    if variant in {"normal", "mirrored", "rotate_90", "rotate_180", "rotate_270"}:
         return _build_crop_candidate(image, focus_region.bbox, variant)
     if variant == "deskew":
         return _build_deskew_candidate(image, focus_region)
@@ -600,6 +649,7 @@ def _variant_order(selection: FocusRegionSelection, analysis: Round1Analysis) ->
     settings = get_settings()
     variants: list[RetryVariant] = ["normal"]
     looks_mirrored = analysis.low_semantic_confidence and analysis.has_complete_contact and analysis.high_risk_keyword_hits == 0
+    looks_inverted = analysis.low_semantic_confidence and analysis.has_complete_contact and selection.shape in {"rectangle", "trapezoid"}
     angled = settings.ocr.focus_retry_deskew_angle_min <= abs(selection.angle) <= settings.ocr.focus_retry_deskew_angle_max
     trapezoid = selection.shape == "trapezoid"
     region_w = selection.bbox[2] - selection.bbox[0]
@@ -610,6 +660,8 @@ def _variant_order(selection: FocusRegionSelection, analysis: Round1Analysis) ->
     looks_vertical_card = vertical_text_bias and analysis.low_semantic_confidence and (analysis.has_complete_contact or analysis.has_partial_contact or sparse_keywords)
     if looks_mirrored and settings.ocr.focus_retry_enable_mirror:
         variants.append("mirrored")
+    if looks_inverted:
+        variants.append("rotate_180")
     if looks_vertical_card:
         variants.extend(["rotate_90", "rotate_270"])
     if trapezoid and settings.ocr.focus_retry_enable_perspective:
@@ -731,14 +783,40 @@ def run_ocr(image_path: str | Path, request_id: str = "ocr-analyze") -> OCRRunRe
     selected_variant = ""
     selected_semantic_score = 0.0
     selected_by_semantic = False
+    variant_order: list[RetryVariant] = _variant_order(focus_selection, round1_analysis) if focus_selection is not None and retry_reason else []
+    logger.info(
+        "run_ocr request_id=%s retry_reason=%s round1_semantic_score=%.4f round1_low_semantic_confidence=%s focus_region=%s variant_order=%s",
+        request_id,
+        retry_reason or "",
+        round1_semantic_score,
+        round1_analysis.low_semantic_confidence,
+        None if focus_selection is None else {
+            "bbox": focus_selection.bbox,
+            "score": focus_selection.score,
+            "angle": round(focus_selection.angle, 4),
+            "shape": focus_selection.shape,
+        },
+        variant_order,
+    )
     if retry_reason and focus_selection is not None:
         retry_results: list[RetryCandidateResult] = []
-        for variant in _variant_order(focus_selection, round1_analysis):
+        for variant in variant_order:
             candidate = build_focus_retry_candidate(image, focus_selection, variant)
             if candidate is None:
+                logger.info("run_ocr request_id=%s variant=%s skipped reason=no_candidate", request_id, variant)
                 continue
             focus_boxes = _predict_candidate(engine, candidate, settings.ocr.use_textline_orientation)
-            retry_results.append(_evaluate_retry_candidate(image, round1_boxes, focus_boxes, candidate, request_id))
+            retry_result = _evaluate_retry_candidate(image, round1_boxes, focus_boxes, candidate, request_id)
+            logger.info(
+                "run_ocr request_id=%s variant=%s focus_boxes=%s semantic_score=%.4f hit_keywords=%s hit_rules=%s",
+                request_id,
+                variant,
+                len(focus_boxes),
+                retry_result.semantic_score,
+                retry_result.evaluation.hit_keywords,
+                retry_result.evaluation.hit_rules,
+            )
+            retry_results.append(retry_result)
 
         best_retry = _select_best_retry_result(retry_results)
         if best_retry is not None and (
@@ -750,6 +828,22 @@ def run_ocr(image_path: str | Path, request_id: str = "ocr-analyze") -> OCRRunRe
             selected_variant = str(best_retry.candidate.variant)
             selected_semantic_score = best_retry.semantic_score
             selected_by_semantic = True
+            logger.info(
+                "run_ocr request_id=%s selected_by_semantic_score=%s selected_variant=%s selected_semantic_score=%.4f selected_hit_keywords=%s",
+                request_id,
+                True,
+                selected_variant,
+                selected_semantic_score,
+                best_retry.evaluation.hit_keywords,
+            )
+        else:
+            logger.info(
+                "run_ocr request_id=%s selected_by_semantic_score=%s reason=no_better_variant",
+                request_id,
+                False,
+            )
+    else:
+        logger.info("run_ocr request_id=%s selected_by_semantic_score=%s reason=no_focus_retry", request_id, False)
 
     final_boxes.sort(key=lambda item: (min(point[1] for point in item.points), min(point[0] for point in item.points)))
     focus_region = (

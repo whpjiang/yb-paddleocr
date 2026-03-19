@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from functools import lru_cache
@@ -12,6 +13,8 @@ import yaml
 from medical_ad_ocr_tools.core.models import AdRegion, OCRBlock, OCRBlockInput, OCRRecord, RuleConfig, RuleEvaluationResponse, RuleEvaluateRequest
 from medical_ad_ocr_tools.core.settings import get_settings
 from medical_ad_ocr_tools.services.card_detector import CardCandidate, detect_card_candidates
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -258,6 +261,8 @@ def _score_candidate(
         if not noise_hits:
             score = max(score, scores.get("phone_only_floor", 48))
             hit_rules.append("fallback.phone_only")
+        else:
+            logger.info("score_candidate fallback.phone_only skipped phones=%s reason=noise_hits noise_hits=%s", phones, noise_hits)
     return min(score, 100), sorted(set(hit_rules)), medical_hits, illegal_hits, phones, wechat_ids, qqs
 
 
@@ -279,10 +284,30 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
                 groups.append((candidate.box, candidate.bbox, items))
 
     groups.extend(_build_text_regions(evidence_list))
+    logger.info("evaluate_blocks request_id=%s groups_count=%s phones=%s global_noise_hits=%s", request_id, len(groups), sorted({phone for item in evidence_list for phone in item.phones}), sorted(global_noise_hits))
 
-    for region_points, region_bbox, items in groups:
+    for group_index, (region_points, region_bbox, items) in enumerate(groups, start=1):
         score, hit_rules, medical_hits, illegal_hits, phones, wechat_ids, qqs = _score_candidate(items, global_noise_hits=global_noise_hits)
+        logger.info(
+            "evaluate_blocks request_id=%s group=%s score=%s phones=%s medical_hits=%s illegal_hits=%s hit_rules=%s block_indices=%s",
+            request_id,
+            group_index,
+            score,
+            phones,
+            medical_hits,
+            illegal_hits,
+            hit_rules,
+            [item.index for item in items],
+        )
         if not _is_suspicious_score(score, config, medical_hits, illegal_hits):
+            logger.info(
+                "evaluate_blocks request_id=%s group=%s skipped reason=below_threshold suspicious_score=%s medical_hits=%s illegal_hits=%s",
+                request_id,
+                group_index,
+                config.suspicious_score,
+                medical_hits,
+                illegal_hits,
+            )
             continue
         refined_points, _ = _refine_region(items, region_points)
         refined_points, refined_bbox = _clip_region(refined_points, image.shape if image is not None else None)
@@ -363,6 +388,18 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
     hit_rules = sorted({rule for block in updated_blocks for rule in block.hit_rules} | {rule for ad in ads for rule in ad.hit_rules})
     risk_score = max((ad.risk_score for ad in ads), default=0)
     ocr_text = "\n".join(block.text for block in updated_blocks)
+    if not ads:
+        if not groups:
+            reason = "no_groups"
+        elif any(item.phones for item in evidence_list) and not any(item.medical_hits or item.illegal_hits for item in evidence_list):
+            reason = "phone_only_without_business_keywords"
+        elif global_noise_hits:
+            reason = f"noise_keywords={sorted(global_noise_hits)}"
+        else:
+            reason = "all_groups_filtered"
+        logger.info("evaluate_blocks request_id=%s ads_empty=true reason=%s hit_rules=%s hit_keywords=%s", request_id, reason, hit_rules, hit_keywords)
+    else:
+        logger.info("evaluate_blocks request_id=%s ads_empty=false ads_count=%s risk_score=%s", request_id, len(ads), risk_score)
     return RuleEvaluationResponse(
         request_id=request_id,
         ocr_text=ocr_text,

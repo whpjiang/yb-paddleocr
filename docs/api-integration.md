@@ -119,7 +119,7 @@ Content-Type: application/json
   - 含义：二次补识别相比首轮新增的 OCR 文字块数量。
 - `focus_retry_variant`
   - 类型：`string`
-  - 含义：二次补识别最终采用的候选版本，可能为 `normal`、`mirrored`、`rotate_90`、`rotate_270`、`deskew`、`perspective`。
+  - 含义：二次补识别最终采用的候选版本，可能为 `normal`、`mirrored`、`rotate_90`、`rotate_180`、`rotate_270`、`deskew`、`perspective`。
 - `focus_retry_semantic_score`
   - 类型：`number`
   - 含义：重点补识别最终候选的业务语义得分。

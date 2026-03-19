@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -8,15 +10,40 @@ from medical_ad_ocr_tools.core.models import HealthResponse, ImageSourcePayload,
 from medical_ad_ocr_tools.core.settings import get_settings
 from medical_ad_ocr_tools.services.image_io import build_request_id, download_image
 from medical_ad_ocr_tools.services.ocr_service import get_ocr_engine
-from medical_ad_ocr_tools.services.rule_service import evaluate_request
+from medical_ad_ocr_tools.services.rule_service import evaluate_request, get_rule_config
 from medical_ad_ocr_tools.services.workflow import analyze_image
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger(__name__)
 settings = get_settings()
 app = FastAPI(title=settings.app.name, version=settings.app.version)
 
 
+def _git_commit() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        return result.stdout.strip()
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
 @app.on_event("startup")
 def preload_models() -> None:
+    rule_config = get_rule_config()
+    logger.info(
+        "startup config rules_path=%s suspicious_score=%s phone_only_floor=%s git_commit=%s version=%s",
+        settings.rules_path,
+        rule_config.suspicious_score,
+        rule_config.scores.get("phone_only_floor"),
+        _git_commit(),
+        settings.app.version,
+    )
     get_ocr_engine()
 
 
