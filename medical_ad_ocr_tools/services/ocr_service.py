@@ -88,11 +88,38 @@ def get_ocr_engine() -> PaddleOCR:
     if settings.ocr.text_recognition_model_name:
         kwargs["text_recognition_model_name"] = settings.ocr.text_recognition_model_name
     if settings.ocr.text_detection_model_dir:
-        kwargs["text_detection_model_dir"] = str(settings.ocr.text_detection_model_dir)
+        detection_model_dir = Path(settings.ocr.text_detection_model_dir)
+        if detection_model_dir.exists():
+            kwargs["text_detection_model_dir"] = str(detection_model_dir)
+        else:
+            logger.warning(
+                "OCR text detection model dir missing, falling back to model name: %s",
+                detection_model_dir,
+            )
     if settings.ocr.text_recognition_model_dir:
-        kwargs["text_recognition_model_dir"] = str(settings.ocr.text_recognition_model_dir)
+        recognition_model_dir = Path(settings.ocr.text_recognition_model_dir)
+        if recognition_model_dir.exists():
+            kwargs["text_recognition_model_dir"] = str(recognition_model_dir)
+        else:
+            logger.warning(
+                "OCR text recognition model dir missing, falling back to model name: %s",
+                recognition_model_dir,
+            )
     if settings.ocr.textline_orientation_model_dir:
-        kwargs["textline_orientation_model_dir"] = str(settings.ocr.textline_orientation_model_dir)
+        textline_orientation_model_dir = Path(settings.ocr.textline_orientation_model_dir)
+        if textline_orientation_model_dir.exists():
+            kwargs["textline_orientation_model_dir"] = str(textline_orientation_model_dir)
+        else:
+            logger.warning(
+                "OCR textline orientation model dir missing, skipping local model dir: %s",
+                textline_orientation_model_dir,
+            )
+    logger.info(
+        "Initializing PaddleOCR with detection_model_dir=%s recognition_model_dir=%s textline_orientation_model_dir=%s",
+        kwargs.get("text_detection_model_dir"),
+        kwargs.get("text_recognition_model_dir"),
+        kwargs.get("textline_orientation_model_dir"),
+    )
     return PaddleOCR(**kwargs)
 
 
