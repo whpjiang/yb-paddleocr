@@ -362,3 +362,30 @@ Content-Type: application/json
 - 业务系统至少保存：`request_id`、`risk_score`、`risk_level`、`suspicious`、`hit_keywords`、`hit_rules`
 - 若需要前端回显，建议同时保存：`ocr_blocks`、`ads`、`annotated_image_url`
 - 若你们自己已有 OCR，也可以只对接 `POST /tools/medical-ad/rule/evaluate`
+## 6. Latest Notes
+
+### 6.1 Annotated Image Response
+
+`POST /tools/medical-ad/ocr/analyze` no longer uploads annotated images to OSS.
+The latest response fields are:
+
+- `annotated_image_name`: PNG file name, for example `task-0011.png`
+- `annotated_image_base64`: Base64 content of the annotated PNG image
+
+The old OSS-style fields are no longer the active integration contract:
+
+- `annotated_image_url`
+- `annotated_image_oss_key`
+
+### 6.2 Temp File Cleanup
+
+The service now uses two cleanup layers:
+
+- `storage/tmp`
+  - delete the downloaded source image after each request finishes
+  - delete files older than 24 hours on service startup
+- `storage/annotated`
+  - delete the generated annotated image after the response is returned
+  - delete files older than 24 hours on service startup
+
+If the caller needs to keep the annotated image, persist `annotated_image_base64` from the response.

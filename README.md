@@ -154,6 +154,39 @@ docker build -t medical-ad-ocr-tools .
 docker run --rm -p 8000:8000 --env-file .env medical-ad-ocr-tools
 ```
 
+## 当前返回口径
+
+- 不再上传阿里云 OSS
+- `POST /tools/medical-ad/ocr/analyze` 命中可疑广告时，会直接返回标注图：
+  - `annotated_image_name`
+  - `annotated_image_base64`
+- 标注图格式为 `PNG`
+
+## 临时文件清理策略
+
+- `storage/tmp`
+  - 每次请求处理完成后，自动删除本次下载的源图片
+  - 服务启动时，自动清理 24 小时前的残留临时文件
+- `storage/annotated`
+  - 每次请求返回后，自动删除本次生成的标注图文件
+  - 服务启动时，自动清理 24 小时前的旧标注文件
+
+这两层清理策略同时存在：
+- 请求级清理：避免单次调用结束后磁盘继续累积
+- 启动级清理：兜底清理异常退出、进程中断留下的历史文件
+
+## 运维部署建议
+
+- 生产建议使用本地模型目录，避免运行时下载模型：
+  - `models/ocr/PP-OCRv5_mobile_det`
+  - `models/ocr/PP-OCRv5_mobile_rec`
+- 默认健康检查接口：
+  - `GET /health`
+- 当前推荐资源规格：
+  - 单实例 `4C8G` 起步
+  - `8C8G + 2 workers` 可作为更高吞吐配置
+- 当前服务属于 CPU 密集型 OCR 服务，优先通过多实例横向扩容提升并发能力
+
 ## 说明
 
 - 当前实现不接入 MySQL、Redis、Celery，也不集成千问视觉模型。
