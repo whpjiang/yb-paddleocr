@@ -484,27 +484,22 @@ def _score_candidate(
     ordered_items = sorted(candidate_items, key=lambda item: (((_box_bounds(item.block.points)[1] + _box_bounds(item.block.points)[3]) / 2), _box_bounds(item.block.points)[0]))
     combined_text = "".join(item.block.text.strip() for item in ordered_items if item.block.text.strip())
     single_chars = {item.block.text.strip() for item in ordered_items if len(item.block.text.strip()) == 1}
-    inferred_medical_hits: set[str] = set()
     inferred_illegal_hits: set[str] = set()
-    if {"医", "保"} <= single_chars:
-        inferred_medical_hits.add("医保")
-    if {"医", "保", "卡"} <= single_chars:
-        inferred_medical_hits.add("医保卡")
     if {"取", "现"} <= single_chars:
         inferred_illegal_hits.add("取现")
     if {"提", "现"} <= single_chars:
         inferred_illegal_hits.add("提现")
-    medical_hits = sorted(
+    actual_medical_hits = sorted(
         {
             word
             for word in (
                 {word for item in candidate_items for word in item.medical_hits}
                 | set(_contains_any(combined_text, config.medical_keywords))
                 | set(_match_aliases(combined_text, config.medical_aliases))
-                | inferred_medical_hits
             )
         }
     )
+    medical_hits = list(actual_medical_hits)
     illegal_hits = sorted(
         {
             word
@@ -555,12 +550,6 @@ def _score_candidate(
     if len(illegal_hits) >= 2:
         score += scores.get("illegal_multi_bonus", 10)
         hit_rules.append("combo.multi_illegal")
-    if phones and not medical_hits and not illegal_hits:
-        if not noise_hits:
-            score = max(score, scores.get("phone_only_floor", 48))
-            hit_rules.append("fallback.phone_only")
-        else:
-            logger.info("score_candidate fallback.phone_only skipped phones=%s reason=noise_hits noise_hits=%s", phones, noise_hits)
     if medical_hits:
         # Business rule: once medical-ad keywords are recovered, treat the region
         # as suspicious at minimum instead of leaving it below the suspicious floor.
