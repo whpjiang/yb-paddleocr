@@ -481,8 +481,41 @@ def _score_candidate(
 ) -> tuple[int, list[str], list[str], list[str], list[str], list[str], list[str], list[int]]:
     config = get_rule_config()
     scores = config.scores
-    medical_hits = sorted({word for item in candidate_items for word in item.medical_hits})
-    illegal_hits = sorted({word for item in candidate_items for word in item.illegal_hits})
+    ordered_items = sorted(candidate_items, key=lambda item: (((_box_bounds(item.block.points)[1] + _box_bounds(item.block.points)[3]) / 2), _box_bounds(item.block.points)[0]))
+    combined_text = "".join(item.block.text.strip() for item in ordered_items if item.block.text.strip())
+    single_chars = {item.block.text.strip() for item in ordered_items if len(item.block.text.strip()) == 1}
+    inferred_medical_hits: set[str] = set()
+    inferred_illegal_hits: set[str] = set()
+    if {"医", "保"} <= single_chars:
+        inferred_medical_hits.add("医保")
+    if {"医", "保", "卡"} <= single_chars:
+        inferred_medical_hits.add("医保卡")
+    if {"取", "现"} <= single_chars:
+        inferred_illegal_hits.add("取现")
+    if {"提", "现"} <= single_chars:
+        inferred_illegal_hits.add("提现")
+    medical_hits = sorted(
+        {
+            word
+            for word in (
+                {word for item in candidate_items for word in item.medical_hits}
+                | set(_contains_any(combined_text, config.medical_keywords))
+                | set(_match_aliases(combined_text, config.medical_aliases))
+                | inferred_medical_hits
+            )
+        }
+    )
+    illegal_hits = sorted(
+        {
+            word
+            for word in (
+                {word for item in candidate_items for word in item.illegal_hits}
+                | set(_contains_any(combined_text, config.illegal_keywords))
+                | set(_match_aliases(combined_text, config.illegal_aliases))
+                | inferred_illegal_hits
+            )
+        }
+    )
     phones, wechat_ids, qqs, attached_contact_indices = filter_attached_contacts(
         candidate_items,
         all_items=all_items,
@@ -490,6 +523,10 @@ def _score_candidate(
         request_id=request_id,
         group_index=group_index,
     )
+    phone_pattern = re.compile(config.phone_pattern)
+    combined_phones = sorted({item for item in (_normalize_phone(raw) for raw in phone_pattern.findall(combined_text)) if item})
+    if combined_phones:
+        phones = sorted(set(phones) | set(combined_phones))
     noise_hits = sorted({word for item in candidate_items for word in item.noise_hits} | set(global_noise_hits or set()))
 
     score = 0
@@ -666,7 +703,7 @@ def evaluate_blocks(blocks: list[OCRBlock], image: np.ndarray | None = None, req
     phones = sorted({phone for item in evidence_list for phone in item.phones})
     wechat_ids = sorted({wechat for item in evidence_list for wechat in item.wechat_ids})
     qqs = sorted({qq for item in evidence_list for qq in item.qqs})
-    hit_keywords = sorted({keyword for block in updated_blocks for keyword in block.hit_keywords})
+    hit_keywords = sorted({keyword for block in updated_blocks for keyword in block.hit_keywords} | {keyword for ad in ads for keyword in ad.hit_keywords})
     hit_rules = sorted({rule for block in updated_blocks for rule in block.hit_rules} | {rule for ad in ads for rule in ad.hit_rules})
     risk_score = max((ad.risk_score for ad in ads), default=0)
     ocr_text = "\n".join(block.text for block in updated_blocks)

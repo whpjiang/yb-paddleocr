@@ -14,7 +14,7 @@ from paddleocr import PaddleOCR
 from medical_ad_ocr_tools.core.models import FocusRegion, OCRBlock, OCRRecord, OCRRunResult, RuleEvaluationResponse
 from medical_ad_ocr_tools.core.settings import get_settings
 from medical_ad_ocr_tools.services.card_detector import CardCandidate, detect_card_candidates
-from medical_ad_ocr_tools.services.rule_service import evaluate_blocks, get_rule_config
+from medical_ad_ocr_tools.services.rule_service import estimate_block_angle, evaluate_blocks, get_rule_config
 
 RetryVariant = Literal["normal", "mirrored", "rotate_90", "rotate_180", "rotate_270", "deskew", "perspective"]
 logger = logging.getLogger(__name__)
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class OCRCandidate:
     name: str
-    variant: RetryVariant | Literal["full", "top_crop"]
+    variant: RetryVariant | str
     image: np.ndarray
     crop_width: int
     crop_height: int
@@ -43,6 +43,7 @@ class FocusRegionSelection:
     block_indices: list[int]
     angle: float
     shape: str
+    source: str = "text_cluster"
     card_candidate: CardCandidate | None = None
 
 
@@ -57,6 +58,7 @@ class Round1Analysis:
     has_card_candidate: bool
     card_candidates: list[CardCandidate]
     low_semantic_confidence: bool
+    oblique_small_text_indices: list[int]
 
 
 @dataclass
@@ -141,6 +143,159 @@ def _build_initial_candidates(image: np.ndarray) -> list[OCRCandidate]:
     if image.shape[0] > image.shape[1] * 1.15:
         top_crop = image[: int(image.shape[0] * 0.82), :]
         candidates.append(_make_initial_candidate(top_crop, "top_crop", 0, 0))
+    return candidates
+
+
+def _make_named_candidate(crop: np.ndarray, name: str, offset_x: int, offset_y: int) -> OCRCandidate:
+    return OCRCandidate(
+        name=name,
+        variant=name,
+        image=crop.copy(),
+        crop_width=crop.shape[1],
+        crop_height=crop.shape[0],
+        scale=1.0,
+        offset_x=offset_x,
+        offset_y=offset_y,
+    )
+
+
+def _build_large_image_retry_candidates(image: np.ndarray) -> list[OCRCandidate]:
+    height, width = image.shape[:2]
+    if max(height, width) < 1800:
+        return []
+    tile_w = min(width, max(int(width * 0.62), width // 2))
+    tile_h = min(height, max(int(height * 0.62), height // 2))
+    if tile_w >= width or tile_h >= height:
+        return []
+    x_starts = sorted({0, max(0, width - tile_w)})
+    y_starts = sorted({0, max(0, height - tile_h)})
+    candidates: list[OCRCandidate] = []
+    for row, y in enumerate(y_starts):
+        for col, x in enumerate(x_starts):
+            crop = image[y : y + tile_h, x : x + tile_w]
+            candidates.append(_make_named_candidate(crop, f"tile_{row}_{col}", x, y))
+    if height > width * 1.05:
+        bottom_crop_y = max(0, height - int(height * 0.72))
+        bottom_crop = image[bottom_crop_y:, :]
+        candidates.append(_make_named_candidate(bottom_crop, "bottom_crop", 0, bottom_crop_y))
+    return candidates
+
+
+def _build_low_signal_scan_candidates(image: np.ndarray) -> list[OCRCandidate]:
+    height, width = image.shape[:2]
+    crop_w = max(int(width * 0.68), min(width, 420))
+    crop_h = max(int(height * 0.68), min(height, 420))
+    crop_w = min(width, crop_w)
+    crop_h = min(height, crop_h)
+    x_starts = sorted({0, max(0, (width - crop_w) // 2), max(0, width - crop_w)})
+    y_starts = sorted({0, max(0, (height - crop_h) // 2), max(0, height - crop_h)})
+    candidates: list[OCRCandidate] = []
+    seen: set[tuple[int, int, int, int]] = set()
+    for row, y in enumerate(y_starts):
+        for col, x in enumerate(x_starts):
+            bbox = (x, y, x + crop_w, y + crop_h)
+            if bbox in seen:
+                continue
+            seen.add(bbox)
+            crop = image[y : y + crop_h, x : x + crop_w]
+            candidates.append(_make_named_candidate(crop, f"scan_{row}_{col}", x, y))
+    if height > width:
+        lower_y = max(0, height - int(height * 0.62))
+        lower_crop = image[lower_y:, :]
+        candidates.append(_make_named_candidate(lower_crop, "scan_lower", 0, lower_y))
+    return candidates[:7]
+
+
+def _detect_qr_regions(image: np.ndarray) -> list[tuple[int, int, int, int]]:
+    detector = cv2.QRCodeDetector()
+    regions: list[tuple[int, int, int, int]] = []
+    try:
+        ok, points = detector.detectMulti(image)
+    except cv2.error:
+        ok, points = False, None
+    if not ok or points is None:
+        return regions
+    for quad in points:
+        pts = np.array(quad, dtype=np.int32)
+        x, y, w, h = cv2.boundingRect(pts)
+        regions.append((x, y, x + w, y + h))
+    return regions
+
+
+def _build_qr_probe_candidates(image: np.ndarray) -> list[OCRCandidate]:
+    candidates: list[OCRCandidate] = []
+    for index, (x1, y1, x2, y2) in enumerate(_detect_qr_regions(image)[:3]):
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        expanded = _clip_bbox(
+            (
+                x1 - max(50, int(width * 1.4)),
+                y1 - max(60, int(height * 1.2)),
+                x2 + max(50, int(width * 1.4)),
+                y2 + max(90, int(height * 1.8)),
+            ),
+            image.shape,
+        )
+        crop = image[expanded[1] : expanded[3], expanded[0] : expanded[2]]
+        if crop.size == 0:
+            continue
+        candidates.append(_make_named_candidate(crop, f"qr_probe_{index}", expanded[0], expanded[1]))
+    return candidates
+
+
+def _build_full_rotation_probe_candidates(image: np.ndarray) -> list[OCRCandidate]:
+    rotated_90 = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    rotated_180 = cv2.rotate(image, cv2.ROTATE_180)
+    rotated_270 = cv2.rotate(image, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return [
+        OCRCandidate(
+            name="full_rotate_90",
+            variant="rotate_90",
+            image=rotated_90,
+            crop_width=image.shape[1],
+            crop_height=image.shape[0],
+            scale=1.0,
+            rotation_quadrants=1,
+        ),
+        OCRCandidate(
+            name="full_rotate_180",
+            variant="rotate_180",
+            image=rotated_180,
+            crop_width=image.shape[1],
+            crop_height=image.shape[0],
+            scale=1.0,
+            rotation_quadrants=2,
+        ),
+        OCRCandidate(
+            name="full_rotate_270",
+            variant="rotate_270",
+            image=rotated_270,
+            crop_width=image.shape[1],
+            crop_height=image.shape[0],
+            scale=1.0,
+            rotation_quadrants=3,
+        ),
+    ]
+
+
+def _build_card_probe_candidates(cards: list[CardCandidate]) -> list[OCRCandidate]:
+    settings = get_settings()
+    candidates: list[OCRCandidate] = []
+    for index, card in enumerate(cards[:3]):
+        processed = _enhance_crop(card.crop)
+        if settings.ocr.focus_retry_scale != 1.0:
+            processed = cv2.resize(processed, None, fx=settings.ocr.focus_retry_scale, fy=settings.ocr.focus_retry_scale, interpolation=cv2.INTER_CUBIC)
+        candidates.append(
+            OCRCandidate(
+                name=f"pre_card_{index}",
+                variant=f"pre_card_{index}",
+                image=processed,
+                crop_width=card.crop.shape[1],
+                crop_height=card.crop.shape[0],
+                scale=settings.ocr.focus_retry_scale,
+                inverse_perspective_matrix=card.inverse_perspective_matrix,
+            )
+        )
     return candidates
 
 
@@ -315,6 +470,97 @@ def _text_has_partial_contact(text: str) -> bool:
     return bool(re.search(r"(微信|vx|V[Xx]|wechat|QQ|qq|手机|电话|1[3-9][0-9]{5,})", text, re.IGNORECASE))
 
 
+def _has_meaningful_text(text: str) -> bool:
+    return bool(re.search(r"[\u4e00-\u9fffA-Za-z0-9]{2,}", text))
+
+
+def _is_punctuation_noise(text: str) -> bool:
+    cleaned = text.strip()
+    return bool(cleaned) and not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", cleaned)
+
+
+def _should_retry_large_image_detection(records: list[OCRRecord], image: np.ndarray) -> bool:
+    if max(image.shape[:2]) < 1800:
+        return False
+    if not records:
+        return True
+    meaningful = [record for record in records if _has_meaningful_text(record.text)]
+    punctuation_only = [record for record in records if _is_punctuation_noise(record.text)]
+    avg_conf = _avg_confidence(records)
+    if meaningful:
+        return False
+    if len(records) <= 8 and len(punctuation_only) >= max(3, len(records) - 1):
+        return True
+    return avg_conf < 0.45 and len(punctuation_only) >= max(1, len(records) // 2)
+
+
+def _has_phone_like_digits(records: list[OCRRecord]) -> bool:
+    return any(re.search(r"\d{7,}", record.text) for record in records)
+
+
+def _has_config_risk_keywords(records: list[OCRRecord]) -> bool:
+    config = get_rule_config()
+    text = "\n".join(record.text for record in records)
+    return any(keyword in text for keyword in (config.medical_keywords + config.illegal_keywords))
+
+
+def _has_noise_keywords(records: list[OCRRecord]) -> bool:
+    text = "\n".join(record.text for record in records)
+    return bool(_noise_hits_for_text(text))
+
+
+def _should_run_low_signal_scan(records: list[OCRRecord], image: np.ndarray) -> bool:
+    if not records:
+        return True
+    meaningful_count = sum(1 for record in records if _has_meaningful_text(record.text))
+    meaningful_len = sum(len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", record.text)) for record in records)
+    if meaningful_len <= 12 and meaningful_count <= 6:
+        return True
+    if meaningful_len <= 18 and not _has_phone_like_digits(records) and max(image.shape[:2]) >= 800:
+        return True
+    return False
+
+
+def _should_run_rotation_probe(records: list[OCRRecord], image: np.ndarray) -> bool:
+    if not records:
+        return True
+    if _has_config_risk_keywords(records):
+        return False
+    meaningful_count = sum(1 for record in records if _has_meaningful_text(record.text))
+    meaningful_len = sum(len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", record.text)) for record in records)
+    if meaningful_len <= 24 and meaningful_count <= 10:
+        return True
+    if _has_phone_like_digits(records) and _has_noise_keywords(records):
+        return True
+    return max(image.shape[:2]) >= 800 and meaningful_count <= 12
+
+
+def _meaningful_text_length(blocks: list[OCRBlock]) -> int:
+    return sum(len(re.findall(r"[\u4e00-\u9fffA-Za-z0-9]", block.text)) for block in blocks)
+
+
+def _low_text_recall(analysis: Round1Analysis) -> bool:
+    return _meaningful_text_length(analysis.evaluation.ocr_blocks) <= 8
+
+
+def _is_oblique_small_text_block(block: OCRBlock, median_center_y: float) -> bool:
+    text = re.sub(r"\s+", "", block.text)
+    if not text or len(text) > 4:
+        return False
+    if not re.search(r"[\u4e00-\u9fffA-Za-z0-9]", text):
+        return False
+    angle = abs(estimate_block_angle(block))
+    if angle < 20.0:
+        return False
+    x1, y1, x2, y2 = _bbox(block.points)
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    has_digit_hint = bool(re.search(r"\d", text))
+    lower_than_main_text = (y1 + y2) / 2 >= median_center_y + max(40.0, height * 0.6)
+    elongated = max(width, height) / max(1.0, min(width, height)) >= 1.15
+    return lower_than_main_text and (has_digit_hint or elongated)
+
+
 def _round1_low_semantic_confidence(evaluation: RuleEvaluationResponse) -> bool:
     all_text = "\n".join(block.text for block in evaluation.ocr_blocks)
     noise_hits = _noise_hits_for_text(all_text)
@@ -331,6 +577,13 @@ def _round1_low_semantic_confidence(evaluation: RuleEvaluationResponse) -> bool:
 def _build_round1_analysis(image: np.ndarray, records: list[OCRRecord], request_id: str) -> Round1Analysis:
     evaluation = evaluate_blocks(blocks=_records_to_blocks(records), image=image, request_id=request_id)
     cards = detect_card_candidates(image)
+    centers_y = [(_bbox(block.points)[1] + _bbox(block.points)[3]) / 2 for block in evaluation.ocr_blocks]
+    median_center_y = float(np.median(centers_y)) if centers_y else 0.0
+    oblique_small_text_indices = [
+        index
+        for index, block in enumerate(evaluation.ocr_blocks)
+        if _is_oblique_small_text_block(block, median_center_y)
+    ]
     return Round1Analysis(
         evaluation=evaluation,
         box_count=len(evaluation.ocr_blocks),
@@ -341,6 +594,7 @@ def _build_round1_analysis(image: np.ndarray, records: list[OCRRecord], request_
         has_card_candidate=bool(cards),
         card_candidates=cards,
         low_semantic_confidence=_round1_low_semantic_confidence(evaluation),
+        oblique_small_text_indices=oblique_small_text_indices,
     )
 
 
@@ -350,12 +604,18 @@ def should_run_focus_retry(round1_analysis: Round1Analysis) -> str:
         return ""
     evaluation = round1_analysis.evaluation
     has_any_risk = round1_analysis.high_risk_keyword_hits >= 1
+    has_oblique_small_text = bool(round1_analysis.oblique_small_text_indices)
+    low_text_recall = _low_text_recall(round1_analysis)
     if evaluation.risk_score >= settings.ocr.focus_retry_mid_risk_max and round1_analysis.has_complete_contact and round1_analysis.high_risk_keyword_hits >= 2:
         return ""
-    if not has_any_risk and not round1_analysis.has_complete_contact and not round1_analysis.has_card_candidate:
+    if not has_any_risk and not round1_analysis.has_complete_contact and not round1_analysis.has_card_candidate and not has_oblique_small_text:
         return ""
+    if round1_analysis.has_card_candidate and not has_any_risk and not round1_analysis.has_complete_contact and low_text_recall:
+        return "card_candidate_low_text_recall"
     if round1_analysis.high_risk_keyword_hits >= settings.ocr.focus_retry_min_keyword_hits and not round1_analysis.has_complete_contact:
         return "high_risk_keywords_missing_contact"
+    if has_oblique_small_text and not has_any_risk and not round1_analysis.has_complete_contact:
+        return "oblique_small_text"
     if round1_analysis.box_count <= 5 and round1_analysis.total_text_length <= 40 and has_any_risk and round1_analysis.has_card_candidate:
         return "sparse_text_with_risk_words"
     if (
@@ -452,6 +712,37 @@ def _estimate_shape_from_boxes(selected: list[OCRBlock]) -> tuple[float, str]:
     return angle, "rectangle" if aspect <= 4.5 else "irregular"
 
 
+def _expanded_bbox_for_block(block: OCRBlock, image_shape: tuple[int, int, int]) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = _bbox(block.points)
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    padding_x = max(24, int(width * 1.0))
+    padding_y = max(28, int(height * 1.0))
+    return _clip_bbox((x1 - padding_x, y1 - padding_y, x2 + padding_x, y2 + padding_y), image_shape)
+
+
+def _expanded_bbox_for_card_candidate(
+    card: CardCandidate,
+    image_shape: tuple[int, int, int],
+    *,
+    aggressive: bool = False,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = card.bbox
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    if aggressive:
+        padding_left = max(80, int(width * 0.85))
+        padding_right = max(60, int(width * 0.35))
+        padding_top = max(70, int(height * 0.40))
+        padding_bottom = max(120, int(height * 0.95))
+    else:
+        padding_left = max(32, int(width * 0.18))
+        padding_right = max(24, int(width * 0.18))
+        padding_top = max(28, int(height * 0.14))
+        padding_bottom = max(36, int(height * 0.18))
+    return _clip_bbox((x1 - padding_left, y1 - padding_top, x2 + padding_right, y2 + padding_bottom), image_shape)
+
+
 def _region_score(
     image: np.ndarray,
     boxes: list[OCRBlock],
@@ -502,6 +793,7 @@ def _region_score(
     shape_score = {"rectangle": 1.0, "trapezoid": 0.9, "irregular": 0.55}.get(shape, 0.55)
     contact_score = min(1.0, (contact_hits + digit_hints) / 3.0)
     keyword_score = min(1.0, keyword_hits / 3.0)
+    oblique_small_text_hits = sum(1 for index in block_indices if index in (analysis.oblique_small_text_indices if analysis is not None else []))
     area_bonus = 0.0
     if overlap_card is not None:
         card_area = max(1, (overlap_card.bbox[2] - overlap_card.bbox[0]) * (overlap_card.bbox[3] - overlap_card.bbox[1]))
@@ -515,8 +807,30 @@ def _region_score(
             score -= 0.18
     if analysis is not None and analysis.has_complete_contact and not keyword_hits and overlap_card is not None and source == "card_candidate":
         score += 0.08
+    if analysis is not None and source == "card_candidate" and preset_card is not None and _low_text_recall(analysis):
+        card_area = max(1, (preset_card.bbox[2] - preset_card.bbox[0]) * (preset_card.bbox[3] - preset_card.bbox[1]))
+        image_area = max(1, image.shape[0] * image.shape[1])
+        card_area_ratio = card_area / image_area
+        if card_area_ratio >= 0.015:
+            score = max(score, 0.46)
+        if shape in {"rectangle", "trapezoid"}:
+            score += 0.08
+        if abs(angle) >= 8.0:
+            score += 0.06
+    if analysis is not None and oblique_small_text_hits and source == "oblique_small_text":
+        score += 0.32
+    elif analysis is not None and oblique_small_text_hits and not keyword_hits and not contact_hits:
+        score += min(0.18, oblique_small_text_hits * 0.12)
     score = round(max(0.0, min(1.0, score)), 4)
-    return FocusRegionSelection(bbox=bbox, score=min(score, 1.0), block_indices=block_indices, angle=angle, shape=shape, card_candidate=overlap_card)
+    return FocusRegionSelection(
+        bbox=bbox,
+        score=min(score, 1.0),
+        block_indices=block_indices,
+        angle=angle,
+        shape=shape,
+        source=source,
+        card_candidate=overlap_card,
+    )
 
 
 def select_best_focus_region(image: np.ndarray, boxes: list[OCRBlock], analysis: Round1Analysis) -> FocusRegionSelection | None:
@@ -531,7 +845,8 @@ def select_best_focus_region(image: np.ndarray, boxes: list[OCRBlock], analysis:
         candidates.append(candidate)
 
     for card in analysis.card_candidates:
-        nearby_indices = _nearby_block_indices(boxes, card.bbox)
+        preset_bbox = _expanded_bbox_for_card_candidate(card, image.shape, aggressive=_low_text_recall(analysis))
+        nearby_indices = _nearby_block_indices(boxes, preset_bbox)
         candidate = _region_score(
             image,
             boxes,
@@ -539,8 +854,25 @@ def select_best_focus_region(image: np.ndarray, boxes: list[OCRBlock], analysis:
             analysis.card_candidates,
             analysis=analysis,
             source="card_candidate",
-            preset_bbox=card.bbox,
+            preset_bbox=preset_bbox,
             preset_card=card,
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+
+    for block_index in analysis.oblique_small_text_indices:
+        expanded_bbox = _expanded_bbox_for_block(boxes[block_index], image.shape)
+        nearby_indices = _nearby_block_indices(boxes, expanded_bbox)
+        if block_index not in nearby_indices:
+            nearby_indices.append(block_index)
+        candidate = _region_score(
+            image,
+            boxes,
+            sorted(set(nearby_indices)),
+            analysis.card_candidates,
+            analysis=analysis,
+            source="oblique_small_text",
+            preset_bbox=expanded_bbox,
         )
         if candidate is not None:
             candidates.append(candidate)
@@ -549,7 +881,12 @@ def select_best_focus_region(image: np.ndarray, boxes: list[OCRBlock], analysis:
     if not candidates:
         return None
     best = candidates[0]
-    if best.score < settings.ocr.focus_retry_min_region_score:
+    min_region_score = settings.ocr.focus_retry_min_region_score
+    if analysis.has_card_candidate and _low_text_recall(analysis):
+        min_region_score = min(min_region_score, 0.32)
+    if analysis.oblique_small_text_indices and analysis.high_risk_keyword_hits == 0 and not analysis.has_complete_contact:
+        min_region_score = min(min_region_score, 0.4)
+    if best.score < min_region_score:
         return None
     return best
 
@@ -567,6 +904,8 @@ def _enhance_crop(crop: np.ndarray) -> np.ndarray:
 
 def _expanded_focus_bbox(image: np.ndarray, selection: FocusRegionSelection, variant: RetryVariant) -> tuple[int, int, int, int]:
     bbox = selection.bbox
+    if selection.source == "card_candidate" and selection.card_candidate is not None:
+        bbox = _expanded_bbox_for_card_candidate(selection.card_candidate, image.shape, aggressive=True)
     if variant in {"rotate_180", "rotate_90", "rotate_270"} and selection.card_candidate is not None:
         card_bbox = selection.card_candidate.bbox
         bbox = (
@@ -705,6 +1044,8 @@ def _variant_order(selection: FocusRegionSelection, analysis: Round1Analysis) ->
     looks_mirrored = analysis.low_semantic_confidence and analysis.has_complete_contact and analysis.high_risk_keyword_hits == 0
     looks_inverted = analysis.low_semantic_confidence and analysis.has_complete_contact and selection.shape in {"rectangle", "trapezoid"}
     angled = settings.ocr.focus_retry_deskew_angle_min <= abs(selection.angle) <= settings.ocr.focus_retry_deskew_angle_max
+    oblique_scene = bool(analysis.oblique_small_text_indices) and analysis.high_risk_keyword_hits == 0 and not analysis.has_complete_contact
+    card_low_text_scene = selection.source == "card_candidate" and selection.card_candidate is not None and _low_text_recall(analysis)
     trapezoid = selection.shape == "trapezoid"
     region_w = selection.bbox[2] - selection.bbox[0]
     region_h = selection.bbox[3] - selection.bbox[1]
@@ -716,12 +1057,21 @@ def _variant_order(selection: FocusRegionSelection, analysis: Round1Analysis) ->
         variants.append("mirrored")
     if looks_inverted:
         variants.append("rotate_180")
+    if card_low_text_scene:
+        variants.extend(["rotate_180", "rotate_90", "rotate_270"])
+    if oblique_scene:
+        variants.extend(["deskew", "rotate_90", "rotate_270"])
     if looks_vertical_card:
         variants.extend(["rotate_90", "rotate_270"])
     if trapezoid and settings.ocr.focus_retry_enable_perspective:
         variants.append("perspective")
     elif angled:
         variants.append("deskew")
+    if card_low_text_scene:
+        if "deskew" not in variants:
+            variants.append("deskew")
+        if settings.ocr.focus_retry_enable_perspective and "perspective" not in variants:
+            variants.append("perspective")
     if looks_mirrored and (angled or trapezoid):
         if settings.ocr.focus_retry_enable_mirror and "mirrored" not in variants:
             variants.append("mirrored")
@@ -820,6 +1170,86 @@ def run_ocr(image_path: str | Path, request_id: str = "ocr-analyze") -> OCRRunRe
     for candidate in _build_initial_candidates(image):
         round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
     round1_boxes = _deduplicate(round1_boxes)
+
+    if _should_run_low_signal_scan(round1_boxes, image):
+        scan_candidates = _build_low_signal_scan_candidates(image)
+        logger.info(
+            "run_ocr request_id=%s low_signal_scan=true initial_boxes=%s scan_candidates=%s",
+            request_id,
+            len(round1_boxes),
+            [candidate.name for candidate in scan_candidates],
+        )
+        for candidate in scan_candidates:
+            round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+        round1_boxes = _deduplicate(round1_boxes)
+    else:
+        logger.info(
+            "run_ocr request_id=%s low_signal_scan=false initial_boxes=%s",
+            request_id,
+            len(round1_boxes),
+        )
+    if _should_run_rotation_probe(round1_boxes, image):
+        rotation_probe_candidates = _build_full_rotation_probe_candidates(image)
+        logger.info(
+            "run_ocr request_id=%s rotation_probe=true candidates=%s",
+            request_id,
+            [candidate.name for candidate in rotation_probe_candidates],
+        )
+        for candidate in rotation_probe_candidates:
+            round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+        round1_boxes = _deduplicate(round1_boxes)
+    else:
+        logger.info("run_ocr request_id=%s rotation_probe=false", request_id)
+
+    if _should_retry_large_image_detection(round1_boxes, image):
+        fallback_candidates = _build_large_image_retry_candidates(image)
+        logger.info(
+            "run_ocr request_id=%s large_image_detection_retry=true initial_boxes=%s fallback_candidates=%s",
+            request_id,
+            len(round1_boxes),
+            [candidate.name for candidate in fallback_candidates],
+        )
+        for candidate in fallback_candidates:
+            round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+        round1_boxes = _deduplicate(round1_boxes)
+    else:
+        logger.info(
+            "run_ocr request_id=%s large_image_detection_retry=false initial_boxes=%s",
+            request_id,
+            len(round1_boxes),
+        )
+    if _should_run_low_signal_scan(round1_boxes, image):
+        qr_probe_candidates = _build_qr_probe_candidates(image)
+        if qr_probe_candidates:
+            logger.info(
+                "run_ocr request_id=%s qr_probe=true qr_candidates=%s",
+                request_id,
+                [candidate.name for candidate in qr_probe_candidates],
+            )
+            for candidate in qr_probe_candidates:
+                round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+            round1_boxes = _deduplicate(round1_boxes)
+        else:
+            logger.info("run_ocr request_id=%s qr_probe=false reason=no_qr_detected", request_id)
+    card_probe_candidates = detect_card_candidates(image)
+    if card_probe_candidates and not any(_has_meaningful_text(record.text) for record in round1_boxes):
+        probe_candidates = _build_card_probe_candidates(card_probe_candidates)
+        logger.info(
+            "run_ocr request_id=%s pre_card_probe=true card_candidates=%s probe_candidates=%s",
+            request_id,
+            len(card_probe_candidates),
+            [candidate.name for candidate in probe_candidates],
+        )
+        for candidate in probe_candidates:
+            round1_boxes.extend(_predict_candidate(engine, candidate, settings.ocr.use_textline_orientation))
+        round1_boxes = _deduplicate(round1_boxes)
+    else:
+        logger.info(
+            "run_ocr request_id=%s pre_card_probe=false card_candidates=%s meaningful_text=%s",
+            request_id,
+            len(card_probe_candidates),
+            any(_has_meaningful_text(record.text) for record in round1_boxes),
+        )
 
     round1_analysis = _build_round1_analysis(image, round1_boxes, request_id)
     retry_reason = should_run_focus_retry(round1_analysis)

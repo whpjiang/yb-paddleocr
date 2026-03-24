@@ -50,15 +50,15 @@ def detect_card_candidates(image: np.ndarray) -> list[CardCandidate]:
 
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area < image_area * 0.0012 or area > image_area * 0.08:
+        if area < image_area * 0.0012 or area > image_area * 0.35:
             continue
         perimeter = cv2.arcLength(contour, True)
         approx = cv2.approxPolyDP(contour, 0.04 * perimeter, True)
         points = cv2.boxPoints(cv2.minAreaRect(contour)) if len(approx) != 4 else approx.reshape(4, 2).astype(np.float32)
         x, y, w, h = cv2.boundingRect(points.astype(np.int32))
-        if w < 28 or h < 28 or w > width * 0.55 or h > height * 0.55:
+        if w < 28 or h < 28 or w > width * 0.9 or h > height * 0.9:
             continue
-        if x <= 2 or y <= 2 or x + w >= width - 2 or y + h >= height - 2:
+        if x <= 1 or y <= 1 or x + w >= width - 1 or y + h >= height - 1:
             continue
         if max(w / max(h, 1), h / max(w, 1)) > 6.5:
             continue
